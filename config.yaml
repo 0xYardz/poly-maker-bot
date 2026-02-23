@@ -1,0 +1,13 @@
+exchanges:
+  polymarket:
+    api_url: "https://clob.polymarket.com"      # CLOB API URL
+    data_api_url: "https://data-api.polymarket.com"  # DATA API URL
+    gamma_api_url: "https://gamma-api.polymarket.com"  # GAMMA API URL
+    rtds_ws_url: "wss://ws-live-data.polymarket.com"         # WS URL
+    ws_url: "wss://ws-subscriptions-clob.polymarket.com/ws/market"     # CLOB WS URL
+    ws_user_url: "wss://ws-subscriptions-clob.polymarket.com/ws/user"  # CLOB User WS URL
+    funder_env: "POLYMARKET_FUNDER"
+    private_key_env: "POLYMARKET_PK"
+    builder_api_key_env: "BUILDER_API_KEY"
+    builder_secret_env: "BUILDER_SECRET"
+    builder_passphrase_env: "BUILDER_PASS_PHRASE"
