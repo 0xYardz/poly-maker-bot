@@ -25,6 +25,7 @@ CREATE TABLE IF NOT EXISTS trades (
     status TEXT DEFAULT 'MATCHED',
     created_at REAL NOT NULL,
     transaction_hash TEXT,
+    strategy TEXT,
     UNIQUE(trade_id, order_id)
 );
 
@@ -35,7 +36,8 @@ CREATE TABLE IF NOT EXISTS markets (
     down_token_id TEXT,
     start_ts REAL,
     end_ts REAL,
-    first_seen_at REAL NOT NULL
+    first_seen_at REAL NOT NULL,
+    resolved_winner TEXT
 );
 
 CREATE TABLE IF NOT EXISTS sessions (
@@ -78,6 +80,24 @@ class TradeDatabase:
                 "ALTER TABLE trades ADD COLUMN transaction_hash TEXT"
             )
             logger.info("Migrated: added transaction_hash column to trades")
+        if "strategy" not in columns:
+            self._conn.execute(
+                "ALTER TABLE trades ADD COLUMN strategy TEXT"
+            )
+            logger.info("Migrated: added strategy column to trades")
+        # Backfill existing trades that have no strategy tag
+        self._conn.execute(
+            "UPDATE trades SET strategy = 'simple_mm' WHERE strategy IS NULL"
+        )
+
+        # Add resolved_winner column to markets table
+        mcur = self._conn.execute("PRAGMA table_info(markets)")
+        mcols = {row[1] for row in mcur.fetchall()}
+        if "resolved_winner" not in mcols:
+            self._conn.execute(
+                "ALTER TABLE markets ADD COLUMN resolved_winner TEXT"
+            )
+            logger.info("Migrated: added resolved_winner column to markets")
 
         # Migrate from UNIQUE(trade_id) to UNIQUE(trade_id, order_id)
         # so partial fills with different order_ids are recorded separately.
@@ -143,6 +163,7 @@ class TradeDatabase:
         order_type: Optional[str] = None,
         status: str = "MATCHED",
         transaction_hash: Optional[str] = None,
+        strategy: Optional[str] = None,
     ) -> None:
         """Insert a trade, ignoring duplicates by trade_id."""
         with self._write_lock:
@@ -151,13 +172,14 @@ class TradeDatabase:
                     """INSERT OR IGNORE INTO trades
                        (trade_id, order_id, token_id, market_slug,
                         side, size, price, usdc_value, outcome,
-                        order_type, status, created_at, transaction_hash)
-                       VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
+                        order_type, status, created_at, transaction_hash,
+                        strategy)
+                       VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
                     (
                         trade_id, order_id, token_id, market_slug,
                         side, size, price, round(size * price, 6),
                         outcome, order_type, status, time.time(),
-                        transaction_hash,
+                        transaction_hash, strategy,
                     ),
                 )
                 self._conn.commit()
@@ -232,13 +254,40 @@ class TradeDatabase:
             except Exception:
                 logger.exception("Failed to end session %d", session_id)
 
+    def set_market_resolution(self, slug: str, winner: str) -> None:
+        """Record which side won: 'UP' or 'DOWN'."""
+        with self._write_lock:
+            try:
+                self._conn.execute(
+                    "UPDATE markets SET resolved_winner = ? WHERE slug = ?",
+                    (winner, slug),
+                )
+                self._conn.commit()
+                logger.info("Market %s resolved: winner=%s", slug, winner)
+            except Exception:
+                logger.exception("Failed to set resolution for %s", slug)
+
+    def get_unresolved_markets(self) -> list[dict]:
+        """Return markets that ended but have no resolution recorded yet."""
+        cur = self._conn.execute(
+            """SELECT slug, question, up_token_id, down_token_id,
+                      start_ts, end_ts, first_seen_at, resolved_winner
+               FROM markets
+               WHERE resolved_winner IS NULL AND end_ts < ?
+               ORDER BY end_ts DESC""",
+            (time.time(),),
+        )
+        cols = [d[0] for d in cur.description]
+        return [dict(zip(cols, row)) for row in cur.fetchall()]
+
     # ── read methods (called from dashboard) ─────────────────
 
     def get_recent_trades(self, limit: int = 100) -> list[dict]:
         cur = self._conn.execute(
             """SELECT trade_id, order_id, token_id, market_slug,
                       side, size, price, usdc_value, outcome,
-                      order_type, status, created_at, transaction_hash
+                      order_type, status, created_at, transaction_hash,
+                      strategy
                FROM trades ORDER BY created_at DESC LIMIT ?""",
             (limit,),
         )
@@ -248,49 +297,102 @@ class TradeDatabase:
     def get_pnl_by_market(self) -> list[dict]:
         """Aggregate trade volume and estimated PnL per market slug.
 
-        PnL estimation: for each market, sum the USDC spent on initial
-        buys and USDC received from reaction buys (which settle at $1
-        if the market resolves in our favor).
+        PnL estimation: pairs up UP and DOWN shares bought for each market.
+        Each paired share is worth exactly $1.00 at resolution (one side pays out).
+        Paired PnL = paired_shares * (1.00 - avg_up_price - avg_down_price).
+        Unmatched shares (excess on one side) are shown separately.
         """
         cur = self._conn.execute(
-            """SELECT market_slug,
+            """SELECT t.market_slug,
                       COUNT(*) as trade_count,
-                      SUM(usdc_value) as total_volume,
-                      SUM(CASE WHEN order_type = 'initial_buy' THEN -usdc_value ELSE 0 END) +
-                      SUM(CASE WHEN order_type = 'fill_reaction_buy' THEN size - usdc_value ELSE 0 END)
-                        as estimated_pnl
-               FROM trades
-               WHERE status != 'FAILED'
-               GROUP BY market_slug
-               ORDER BY MAX(created_at) DESC""",
+                      SUM(t.usdc_value) as total_volume,
+                      -- UP side totals
+                      COALESCE(SUM(CASE WHEN t.token_id = m.up_token_id THEN t.size ELSE 0 END), 0) as up_shares,
+                      COALESCE(SUM(CASE WHEN t.token_id = m.up_token_id THEN t.usdc_value ELSE 0 END), 0) as up_cost,
+                      -- DOWN side totals
+                      COALESCE(SUM(CASE WHEN t.token_id = m.down_token_id THEN t.size ELSE 0 END), 0) as down_shares,
+                      COALESCE(SUM(CASE WHEN t.token_id = m.down_token_id THEN t.usdc_value ELSE 0 END), 0) as down_cost,
+                      MAX(t.strategy) as strategy,
+                      m.resolved_winner
+               FROM trades t
+               JOIN markets m ON t.market_slug = m.slug
+               WHERE t.status != 'FAILED'
+               GROUP BY t.market_slug
+               ORDER BY MAX(t.created_at) DESC""",
         )
         cols = [d[0] for d in cur.description]
-        return [dict(zip(cols, row)) for row in cur.fetchall()]
+        rows = [dict(zip(cols, row)) for row in cur.fetchall()]
+
+        # Compute paired PnL for each market
+        for r in rows:
+            up_s, dn_s = r["up_shares"], r["down_shares"]
+            up_c, dn_c = r["up_cost"], r["down_cost"]
+            paired = min(up_s, dn_s)
+
+            if paired > 0:
+                # Average prices for each side
+                up_avg = up_c / up_s if up_s > 0 else 0
+                dn_avg = dn_c / dn_s if dn_s > 0 else 0
+                # Each pair pays out $1.00 at resolution
+                r["paired_pnl"] = round(paired * (1.00 - up_avg - dn_avg), 6)
+            else:
+                r["paired_pnl"] = 0.0
+
+            r["paired_shares"] = paired
+            r["unmatched_shares"] = abs(up_s - dn_s)
+            r["unmatched_side"] = "UP" if up_s > dn_s else "DOWN" if dn_s > up_s else None
+            # Total cost of unmatched shares (worth $1 or $0 depending on resolution)
+            if up_s > dn_s and up_s > 0:
+                r["unmatched_cost"] = round((up_s - dn_s) * (up_c / up_s), 4)
+            elif dn_s > up_s and dn_s > 0:
+                r["unmatched_cost"] = round((dn_s - up_s) * (dn_c / dn_s), 4)
+            else:
+                r["unmatched_cost"] = 0.0
+
+            # Unmatched PnL: if market resolved, we know the outcome
+            winner = r.get("resolved_winner")
+            if winner and r["unmatched_shares"] > 0:
+                # Winner side pays $1.00 per share, loser pays $0.00
+                if r["unmatched_side"] == winner:
+                    # We hold excess winning shares: profit = shares * (1.00 - avg_price)
+                    r["unmatched_pnl"] = round(
+                        r["unmatched_shares"] * (1.00 - r["unmatched_cost"] / r["unmatched_shares"]), 4
+                    )
+                else:
+                    # We hold excess losing shares: loss = -cost
+                    r["unmatched_pnl"] = round(-r["unmatched_cost"], 4)
+                r["resolved"] = True
+            else:
+                r["unmatched_pnl"] = 0.0
+                r["resolved"] = winner is not None
+
+            r["estimated_pnl"] = round(r["paired_pnl"] + r["unmatched_pnl"], 6)
+
+        return rows
 
     def get_all_time_stats(self) -> dict:
-        """Return aggregate stats across all trades."""
-        cur = self._conn.execute(
-            """SELECT COUNT(*) as total_trades,
-                      COALESCE(SUM(usdc_value), 0) as total_volume,
-                      COUNT(DISTINCT market_slug) as markets_traded,
-                      COALESCE(
-                        SUM(CASE WHEN order_type = 'initial_buy' THEN -usdc_value ELSE 0 END) +
-                        SUM(CASE WHEN order_type = 'fill_reaction_buy' THEN size - usdc_value ELSE 0 END),
-                        0
-                      ) as estimated_pnl
-               FROM trades WHERE status != 'FAILED'""",
-        )
-        row = cur.fetchone()
-        cols = [d[0] for d in cur.description]
-        return dict(zip(cols, row)) if row else {
-            "total_trades": 0, "total_volume": 0,
-            "markets_traded": 0, "estimated_pnl": 0,
+        """Return aggregate stats across all trades.
+
+        Uses the same paired-shares PnL formula as get_pnl_by_market():
+        sum of paired_pnl across all markets.
+        """
+        pnl_rows = self.get_pnl_by_market()
+        total_trades = sum(r["trade_count"] for r in pnl_rows)
+        total_volume = sum(r["total_volume"] for r in pnl_rows)
+        markets_traded = len(pnl_rows)
+        estimated_pnl = sum(r["estimated_pnl"] for r in pnl_rows)
+
+        return {
+            "total_trades": total_trades,
+            "total_volume": total_volume,
+            "markets_traded": markets_traded,
+            "estimated_pnl": round(estimated_pnl, 6),
         }
 
     def get_markets_traded(self) -> list[dict]:
         cur = self._conn.execute(
             """SELECT slug, question, up_token_id, down_token_id,
-                      start_ts, end_ts, first_seen_at
+                      start_ts, end_ts, first_seen_at, resolved_winner
                FROM markets ORDER BY first_seen_at DESC""",
         )
         cols = [d[0] for d in cur.description]

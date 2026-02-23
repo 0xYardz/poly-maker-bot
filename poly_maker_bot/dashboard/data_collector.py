@@ -112,14 +112,29 @@ class DashboardDataCollector:
         if s is None:
             return None
         from poly_maker_bot.strategy.simple_mm import SimpleMarketMaker
-        if not isinstance(s, SimpleMarketMaker):
-            return {"running": s.is_running}
-        return {
+        from poly_maker_bot.strategy.volatile_mm import VolatileMarketMaker
+
+        base = {
             "running": s.is_running,
             "market_slug": s.market.slug,
-            "pending_reactions": len(s._pending_reactions),
-            "pending_fill_size": dict(s._pending_fill_size),
         }
+
+        if isinstance(s, VolatileMarketMaker):
+            base.update({
+                "type": "volatile_mm",
+                "pending_reactions": len(s._pending_reactions),
+                "pending_fill_size": dict(s._pending_fill_size),
+                "total_bought": dict(s._total_bought),
+                "layered_orders": len(s._layered_orders),
+            })
+        elif isinstance(s, SimpleMarketMaker):
+            base.update({
+                "type": "simple_mm",
+                "pending_reactions": len(s._pending_reactions),
+                "pending_fill_size": dict(s._pending_fill_size),
+            })
+
+        return base
 
     def _collect_metrics(self) -> dict:
         client = self._bot.client

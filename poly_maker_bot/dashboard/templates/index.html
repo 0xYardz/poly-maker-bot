@@ -312,6 +312,44 @@
   .tag.sell { background: var(--red-dim); color: var(--red); }
   .tag.initial { background: var(--blue-dim); color: var(--blue); }
   .tag.reaction { background: var(--yellow-dim); color: var(--yellow); }
+
+  /* ── Tabs ───────────────────────────────── */
+  .tab-bar {
+    display: flex;
+    gap: 4px;
+    margin-bottom: 14px;
+  }
+  .tab-bar .tab {
+    padding: 5px 14px;
+    font-size: 11px;
+    font-weight: 600;
+    text-transform: uppercase;
+    letter-spacing: 0.6px;
+    border-radius: 6px;
+    cursor: pointer;
+    color: var(--text-muted);
+    background: transparent;
+    border: 1px solid transparent;
+    transition: all 0.15s ease;
+  }
+  .tab-bar .tab:hover {
+    color: var(--text);
+    background: var(--surface2);
+  }
+  .tab-bar .tab.active {
+    color: var(--blue);
+    background: var(--blue-dim);
+    border-color: rgba(91,160,245,0.25);
+  }
+  .card-header {
+    display: flex;
+    align-items: center;
+    justify-content: space-between;
+    margin-bottom: 14px;
+  }
+  .card-header .card-title {
+    margin-bottom: 0;
+  }
 </style>
 </head>
 <body>
@@ -360,15 +398,21 @@
     <div id="strategy-content" class="empty">No active strategy</div>
   </div>
 
-  <!-- PnL by Market -->
+  <!-- Strategy/Timespan Tabs + PnL by Market -->
   <div class="card full">
-    <div class="card-title">PnL by Market</div>
+    <div class="card-header">
+      <div class="card-title">PnL by Market</div>
+      <div class="tab-bar" id="pnl-tabs"></div>
+    </div>
     <div id="pnl-market-content" class="scroll-y empty">No market data yet</div>
   </div>
 
-  <!-- Recent Trades -->
+  <!-- Recent Trades (follows same tab) -->
   <div class="card full">
-    <div class="card-title">Recent Trades</div>
+    <div class="card-header">
+      <div class="card-title">Recent Trades</div>
+      <div class="tab-bar" id="trades-tabs"></div>
+    </div>
     <div id="trades-content" class="scroll-y empty">No trades yet</div>
   </div>
 
@@ -383,6 +427,8 @@
 // ── State ──────────────────────────────────
 let currentMarket = null;
 let historicalData = {};
+let activeTab = 'all';  // 'all' or strategy name like 'simple_mm', 'volatile_mm'
+let _lastRealtimeData = null;
 
 // ── Helpers ────────────────────────────────
 function pnlClass(v) { return v > 0.0001 ? 'positive' : v < -0.0001 ? 'negative' : 'neutral'; }
@@ -415,6 +461,58 @@ function tokenLabel(tokenId) {
   if (tokenId === currentMarket.up_token_id) return 'UP';
   if (tokenId === currentMarket.down_token_id) return 'DOWN';
   return truncId(tokenId);
+}
+
+// Human-readable labels for strategy names
+const STRATEGY_DISPLAY = {
+  'simple_mm':   'Simple MM',
+  'volatile_mm': 'Volatile MM',
+};
+function strategyDisplayName(strategy) {
+  return STRATEGY_DISPLAY[strategy] || strategy || 'Unknown';
+}
+
+function matchesTab(item) {
+  if (activeTab === 'all') return true;
+  return (item.strategy || null) === activeTab;
+}
+
+function setTab(tab) {
+  activeTab = tab;
+  document.querySelectorAll('.tab-bar .tab').forEach(el => {
+    el.classList.toggle('active', el.dataset.tab === tab);
+  });
+  updateHistorical(historicalData);
+  if (_lastRealtimeData) updateSummary(_lastRealtimeData);
+}
+
+// Discover unique strategies from DB data and render tab bars
+function renderTabs() {
+  const strategies = new Set();
+
+  // Collect strategies from both PnL and trades data
+  for (const m of (historicalData?.pnl_by_market || [])) {
+    if (m.strategy) strategies.add(m.strategy);
+  }
+  for (const t of (historicalData?.recent_trades || [])) {
+    if (t.strategy) strategies.add(t.strategy);
+  }
+
+  // Only show tabs if there's more than one strategy (or at least one)
+  if (strategies.size === 0) {
+    document.getElementById('pnl-tabs').innerHTML = '';
+    document.getElementById('trades-tabs').innerHTML = '';
+    return;
+  }
+
+  let tabHtml = `<div class="tab ${activeTab === 'all' ? 'active' : ''}" data-tab="all" onclick="setTab('all')">All</div>`;
+  const sorted = Array.from(strategies).sort();
+  for (const s of sorted) {
+    tabHtml += `<div class="tab ${activeTab === s ? 'active' : ''}" data-tab="${s}" onclick="setTab('${s}')">${strategyDisplayName(s)}</div>`;
+  }
+
+  document.getElementById('pnl-tabs').innerHTML = tabHtml;
+  document.getElementById('trades-tabs').innerHTML = tabHtml;
 }
 
 // ── SSE Connection ─────────────────────────
@@ -451,6 +549,7 @@ fetch('/api/state')
 // ── Update Functions ───────────────────────
 
 function updateRealtime(data) {
+  _lastRealtimeData = data;
   currentMarket = data.current_market;
   if (data.historical) {
     historicalData = data.historical;
@@ -467,6 +566,7 @@ function updateRealtime(data) {
 
 function updateHistorical(hist) {
   if (!hist) return;
+  renderTabs();
   updatePnlByMarket(hist.pnl_by_market);
   updateTrades(hist.recent_trades);
 }
@@ -482,16 +582,19 @@ function updateSummary(data) {
   const sessionPnl = realized + totalUnrealized;
   const posCount = Object.keys(data.positions || {}).length;
 
-  const allTime = historicalData?.all_time_stats || {};
-  const allTimePnl = allTime.estimated_pnl || 0;
-  const allTimeTrades = allTime.total_trades || 0;
-  const marketsTraded = allTime.markets_traded || 0;
+  // Compute filtered stats from historical data
+  const pnlByMarket = (historicalData?.pnl_by_market || []).filter(m => matchesTab(m));
+  const filteredPnl = pnlByMarket.reduce((sum, m) => sum + (m.estimated_pnl || 0), 0);
+  const filteredTrades = pnlByMarket.reduce((sum, m) => sum + (m.trade_count || 0), 0);
+  const filteredMarkets = pnlByMarket.length;
+
+  const tabLabel = activeTab === 'all' ? 'All-Time' : strategyDisplayName(activeTab);
 
   document.getElementById('summary').innerHTML = `
     <div class="stat-card">
-      <div class="stat-label">All-Time PnL</div>
-      <div class="stat-value ${pnlClass(allTimePnl)}">${pnlSign(allTimePnl)}${fmt$(allTimePnl,2)}</div>
-      <div class="stat-sub">${allTimeTrades} trades</div>
+      <div class="stat-label">${tabLabel} PnL</div>
+      <div class="stat-value ${pnlClass(filteredPnl)}">${pnlSign(filteredPnl)}${fmt$(filteredPnl,2)}</div>
+      <div class="stat-sub">${filteredTrades} trades</div>
     </div>
     <div class="stat-card">
       <div class="stat-label">Session PnL</div>
@@ -504,9 +607,9 @@ function updateSummary(data) {
       <div class="stat-sub">${posCount} position${posCount!==1?'s':''}</div>
     </div>
     <div class="stat-card">
-      <div class="stat-label">Markets Traded</div>
-      <div class="stat-value neutral">${marketsTraded}</div>
-      <div class="stat-sub">all time</div>
+      <div class="stat-label">${tabLabel} Markets</div>
+      <div class="stat-value neutral">${filteredMarkets}</div>
+      <div class="stat-sub">${activeTab === 'all' ? 'all time' : strategyDisplayName(activeTab)}</div>
     </div>
   `;
 }
@@ -614,11 +717,35 @@ function updateStrategy(s) {
     ? fillEntries.map(([tid, sz]) => `${tokenLabel(tid)}: ${sz.toFixed(1)}`).join(', ')
     : 'None';
 
+  const stratType = s.type === 'volatile_mm' ? 'Volatile MM' : s.type === 'simple_mm' ? 'Simple MM' : s.type || '-';
+
+  let extraItems = '';
+  if (s.type === 'volatile_mm') {
+    const boughtEntries = Object.entries(s.total_bought || {});
+    const boughtStr = boughtEntries.length > 0
+      ? boughtEntries.map(([tid, sz]) => `${tokenLabel(tid)}: ${sz.toFixed(0)}`).join(', ')
+      : '0';
+    extraItems = `
+      <div class="strategy-item">
+        <div class="label">Layered Orders</div>
+        <div class="val">${s.layered_orders ?? 0}</div>
+      </div>
+      <div class="strategy-item">
+        <div class="label">Total Bought</div>
+        <div class="val">${boughtStr}</div>
+      </div>
+    `;
+  }
+
   el.innerHTML = `
     <div class="strategy-grid">
       <div class="strategy-item">
         <div class="label">Status</div>
         <div class="val" style="color:${s.running ? 'var(--green)' : 'var(--red)'}">${s.running ? 'Running' : 'Stopped'}</div>
+      </div>
+      <div class="strategy-item">
+        <div class="label">Strategy</div>
+        <div class="val">${stratType}</div>
       </div>
       <div class="strategy-item">
         <div class="label">Market</div>
@@ -632,13 +759,15 @@ function updateStrategy(s) {
         <div class="label">Fill Accumulator</div>
         <div class="val">${fillStr}</div>
       </div>
+      ${extraItems}
     </div>
   `;
 }
 
 function updatePnlByMarket(pnlByMarket) {
   const el = document.getElementById('pnl-market-content');
-  if (!pnlByMarket || pnlByMarket.length === 0) {
+  const filtered = (pnlByMarket || []).filter(m => matchesTab(m));
+  if (filtered.length === 0) {
     el.className = 'scroll-y empty';
     el.textContent = 'No market data yet';
     return;
@@ -647,16 +776,31 @@ function updatePnlByMarket(pnlByMarket) {
 
   let html = '<table><thead><tr>' +
     '<th>Market</th><th class="text-right">Trades</th>' +
-    '<th class="text-right">Volume</th><th class="text-right">Est. PnL</th>' +
+    '<th class="text-right">Paired</th>' +
+    '<th class="text-right">Paired PnL</th>' +
+    '<th class="text-right">Unmatched</th>' +
+    '<th class="text-right">Total PnL</th>' +
     '</tr></thead><tbody>';
 
-  for (const m of pnlByMarket) {
-    const pnlVal = m.estimated_pnl || 0;
+  for (const m of filtered) {
+    const pairedPnl = m.paired_pnl || 0;
+    const unmatchedPnl = m.unmatched_pnl || 0;
+    const totalPnl = m.estimated_pnl || 0;
+    const unmatchedLabel = m.unmatched_shares > 0
+      ? `${m.unmatched_shares.toFixed(0)} ${m.unmatched_side}`
+      : '-';
+    const unmatchedDetail = m.unmatched_shares > 0
+      ? (m.resolved
+        ? ` <span class="${pnlClass(unmatchedPnl)}">${pnlSign(unmatchedPnl)}${fmt$(unmatchedPnl, 2)}</span>`
+        : ` <span style="color:var(--text-dim)">(${fmt$(m.unmatched_cost, 2)} at risk)</span>`)
+      : '';
     html += `<tr>
-      <td>${m.market_slug}</td>
+      <td>${m.market_slug}${m.resolved ? ' <span style="color:var(--text-dim);font-size:10px">&#10003;</span>' : ''}</td>
       <td class="text-right">${m.trade_count}</td>
-      <td class="text-right">${fmt$(m.total_volume, 2)}</td>
-      <td class="text-right ${pnlClass(pnlVal)}">${pnlSign(pnlVal)}${fmt$(pnlVal, 4)}</td>
+      <td class="text-right">${(m.paired_shares || 0).toFixed(0)}</td>
+      <td class="text-right ${pnlClass(pairedPnl)}">${pnlSign(pairedPnl)}${fmt$(pairedPnl, 4)}</td>
+      <td class="text-right">${unmatchedLabel}${unmatchedDetail}</td>
+      <td class="text-right ${pnlClass(totalPnl)}">${pnlSign(totalPnl)}${fmt$(totalPnl, 4)}</td>
     </tr>`;
   }
   html += '</tbody></table>';
@@ -665,7 +809,8 @@ function updatePnlByMarket(pnlByMarket) {
 
 function updateTrades(trades) {
   const el = document.getElementById('trades-content');
-  if (!trades || trades.length === 0) {
+  const filtered = (trades || []).filter(t => matchesTab(t));
+  if (filtered.length === 0) {
     el.className = 'scroll-y empty';
     el.textContent = 'No trades yet';
     return;
@@ -677,7 +822,7 @@ function updateTrades(trades) {
     '<th>Price</th><th class="text-right">USDC</th><th>Type</th><th>Tx</th>' +
     '</tr></thead><tbody>';
 
-  for (const t of trades.slice(0, 50)) {
+  for (const t of filtered.slice(0, 50)) {
     const typeTag = (t.order_type || '').includes('reaction') ? 'reaction' : 'initial';
     const txLink = t.transaction_hash
       ? `<a href="https://polygonscan.com/tx/${t.transaction_hash}" target="_blank" rel="noopener" style="color:var(--blue);text-decoration:none">${t.transaction_hash.slice(0,6)}...${t.transaction_hash.slice(-4)}</a>`

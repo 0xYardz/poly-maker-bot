@@ -3,8 +3,10 @@ from __future__ import annotations
 
 from poly_maker_bot.strategy.base import StrategyEngine
 from poly_maker_bot.strategy.simple_mm import SimpleMarketMaker
+from poly_maker_bot.strategy.volatile_mm import VolatileMarketMaker
 
 __all__ = [
     "StrategyEngine",
     "SimpleMarketMaker",
+    "VolatileMarketMaker",
 ]
