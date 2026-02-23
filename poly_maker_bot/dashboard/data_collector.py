@@ -74,10 +74,28 @@ class DashboardDataCollector:
 
     def _collect_pnl(self) -> dict:
         bot = self._bot
+        positions = bot.position_tracker.get_all_positions()
+
+        def _get_exit_price(token_id: str):
+            store = bot.orderbook_stores.get(token_id)
+            if store is None:
+                return None
+            try:
+                tob = store.top()
+                # Prefer best_bid (realistic sell price), fall back to best_ask
+                return tob.best_bid if tob.best_bid is not None else tob.best_ask
+            except Exception:
+                return None
+
+        from poly_maker_bot.position.pnl_calculator import calculate_unrealized_pnl
+        pnl_by_token, pnl_pct_by_token, total_unrealized = calculate_unrealized_pnl(
+            positions, _get_exit_price,
+        )
+
         return {
-            "unrealized_by_token": dict(bot.unrealized_pnl),
-            "unrealized_pct_by_token": dict(bot.unrealized_pnl_pct),
-            "total_unrealized": bot.total_unrealized_pnl,
+            "unrealized_by_token": pnl_by_token,
+            "unrealized_pct_by_token": pnl_pct_by_token,
+            "total_unrealized": total_unrealized,
             "realized": bot.realized_pnl,
         }
 

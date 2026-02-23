@@ -484,6 +484,11 @@ class LiquidityProviderBot:
 
         if old_market:
             self._deactivate_market(old_market)
+            # Clear stale positions from ended market so dashboard stays clean
+            old_tokens = [old_market.up_token_id, old_market.down_token_id]
+            removed = self.position_tracker.remove_tokens(old_tokens)
+            if removed:
+                logger.info("Cleared %d position(s) from ended market %s", removed, old_market.slug)
 
         if new_market is None:
             # Pre-fetch failed earlier — try again synchronously

@@ -27,11 +27,11 @@ _OT_FILL_REACTION = "fill_reaction_buy"
 # ── Strategy constants ───────────────────────────────────────
 MAX_ORDER_SIZE = 10.0           # max shares per single order
 MIN_ORDER_SIZE = 5.0            # exchange minimum
-MAX_IMBALANCE = 10.0            # max net imbalance (this_side - opposite_side)
+MAX_IMBALANCE = 14.0            # max net imbalance (this_side - opposite_side)
 MAX_BOUGHT_PER_SIDE = 60.0     # max total shares bought per token across the session
 
-NUM_LAYERS = 3                  # number of BUY orders per token
-LAYER_SPACING = 0.01            # 1c between layers (before volatility adjustment)
+NUM_LAYERS = 2                 # number of BUY orders per token
+LAYER_SPACING = 0.02            # 1c between layers (before volatility adjustment)
 TICK_SIZE = 0.01                # price tick size
 
 CANCEL_BEFORE_END_SEC = 15      # cancel unfilled orders with <15s left
@@ -53,6 +53,15 @@ SKEW_SENSITIVITY = 0.005        # 0.5c per share
 
 # Orderbook imbalance: max skew from imbalance signal
 IMBALANCE_SKEW_MAX = 0.02       # max 2c skew
+
+# ── Side selection constants ────────────────────────────────
+SIDE_STICKINESS_TICKS = 6          # min ticks on a side before switching (3s at 0.5s tick)
+SIDE_SCORE_PRICE_WEIGHT = 0.40     # prefer side with better risk/reward
+SIDE_SCORE_INVENTORY_WEIGHT = 0.35 # prefer the lighter side
+SIDE_SCORE_IMBALANCE_WEIGHT = 0.15 # prefer side with bullish book
+SIDE_SCORE_BOUGHT_WEIGHT = 0.10    # prefer side with more remaining capacity
+SIDE_SWITCH_THRESHOLD = 0.15       # score bonus for current side (hysteresis)
+PRICE_AVOID_THRESHOLD = 0.10       # avoid quoting a side priced below 10c (likely loser)
 
 # Statuses that confirm a trade is on-chain
 _CONFIRMED_STATUSES = frozenset({"MINED", "CONFIRMED"})
@@ -88,13 +97,15 @@ class VolatileMarketMaker(StrategyEngine):
     Volatile market maker for 5m up/down binary markets.
 
     Strategy:
-    - Place layered BUY orders on both UP and DOWN tokens around the current
-      best bid (join best bid, then 1c below, 2c below).
+    - Dynamically select ONE side (UP or DOWN) to quote each tick based on
+      price, inventory, orderbook imbalance, and remaining capacity signals.
+    - Place layered BUY orders on the chosen side around the current best bid
+      (join best bid, then 1c below, 2c below).
     - On fill at price P, react by buying the opposite token at 1.00 - P - tick_size,
       locking in 1 tick of profit per share.
     - Adapts layer spacing and sizes to orderbook volatility.
     - Skews quotes based on current inventory to avoid one-sided accumulation.
-    - Uses orderbook imbalance as a directional signal.
+    - Includes hysteresis to prevent rapid side-flipping.
     """
 
     def __init__(
@@ -131,6 +142,11 @@ class VolatileMarketMaker(StrategyEngine):
         # Cumulative shares bought per token (never resets within a market window)
         self._total_bought: dict[str, float] = {}
         self._total_bought_lock = threading.Lock()
+
+        # ── Side selection state ─────────────────────────────────
+        self._active_side: str | None = None      # "UP" or "DOWN" or None
+        self._side_locked_until_tick: int = 0      # tick count when lock expires
+        self._tick_count: int = 0
 
     # ── order helpers ────────────────────────────────────────────
 
@@ -191,6 +207,7 @@ class VolatileMarketMaker(StrategyEngine):
         3. Refresh layered orders at updated prices.
         """
         now = time.time()
+        self._tick_count += 1
 
         # ── Check for timed-out pending reactions ──
         with self._pending_reactions_lock:
@@ -449,14 +466,14 @@ class VolatileMarketMaker(StrategyEngine):
         self,
     ) -> tuple[list[tuple[float, float]], list[tuple[float, float]]]:
         """
-        Compute target (price, size) layers for UP and DOWN BUY orders.
+        Compute target (price, size) layers for the dynamically chosen side.
 
-        Layers are anchored to the current best bid on each token, then
-        adjusted for volatility, inventory skew, and orderbook imbalance.
+        ONE-SIDED QUOTING: only the chosen side gets layers; the other returns
+        empty (causing _refresh_layered_orders to cancel stale orders there).
 
         Returns:
             (up_layers, down_layers) — each a list of (price, size) tuples.
-            Either list may be empty if no orderbook data or inventory limit reached.
+            Exactly one will be non-empty (or both empty if no data / limit hit).
         """
         up_store = self.get_orderbook(self.market.up_token_id)
         down_store = self.get_orderbook(self.market.down_token_id)
@@ -511,29 +528,44 @@ class VolatileMarketMaker(StrategyEngine):
             up_total_bought = self._total_bought.get(self.market.up_token_id, 0.0)
             down_total_bought = self._total_bought.get(self.market.down_token_id, 0.0)
 
-        # Build UP layers
-        up_layers = self._build_layers(
-            best_bid=up_best_bid,
-            effective_spacing=effective_spacing,
-            base_size=base_size,
-            inventory=up_inventory,
-            opposite_inventory=down_inventory,
-            total_bought=up_total_bought,
-            inv_skew=up_inv_skew,
-            imb_skew=up_imb_skew,
+        # ── Select which side to quote ──
+        chosen_side = self._select_quoting_side(
+            up_best_bid=up_best_bid,
+            down_best_bid=down_best_bid,
+            up_inventory=up_inventory,
+            down_inventory=down_inventory,
+            up_imbalance=up_imbalance,
+            down_imbalance=down_imbalance,
+            up_total_bought=up_total_bought,
+            down_total_bought=down_total_bought,
         )
 
-        # Build DOWN layers
-        down_layers = self._build_layers(
-            best_bid=down_best_bid,
-            effective_spacing=effective_spacing,
-            base_size=base_size,
-            inventory=down_inventory,
-            opposite_inventory=up_inventory,
-            total_bought=down_total_bought,
-            inv_skew=down_inv_skew,
-            imb_skew=down_imb_skew,
-        )
+        # Build layers only for the chosen side
+        up_layers: list[tuple[float, float]] = []
+        down_layers: list[tuple[float, float]] = []
+
+        if chosen_side == "UP":
+            up_layers = self._build_layers(
+                best_bid=up_best_bid,
+                effective_spacing=effective_spacing,
+                base_size=base_size,
+                inventory=up_inventory,
+                opposite_inventory=down_inventory,
+                total_bought=up_total_bought,
+                inv_skew=up_inv_skew,
+                imb_skew=up_imb_skew,
+            )
+        else:
+            down_layers = self._build_layers(
+                best_bid=down_best_bid,
+                effective_spacing=effective_spacing,
+                base_size=base_size,
+                inventory=down_inventory,
+                opposite_inventory=up_inventory,
+                total_bought=down_total_bought,
+                inv_skew=down_inv_skew,
+                imb_skew=down_imb_skew,
+            )
 
         return up_layers, down_layers
 
@@ -731,3 +763,114 @@ class VolatileMarketMaker(StrategyEngine):
         if total == 0:
             return 0.0
         return (total_bid_vol - total_ask_vol) / total
+
+    # ── side selection ────────────────────────────────────────────
+
+    def _select_quoting_side(
+        self,
+        up_best_bid: float | None,
+        down_best_bid: float | None,
+        up_inventory: float,
+        down_inventory: float,
+        up_imbalance: float,
+        down_imbalance: float,
+        up_total_bought: float,
+        down_total_bought: float,
+    ) -> str:
+        """
+        Choose which side ("UP" or "DOWN") to quote this tick.
+
+        Uses a weighted composite score across price, inventory, imbalance,
+        and remaining capacity.  Includes hysteresis (score bonus for current
+        side) and tick-based stickiness to prevent rapid flip-flopping.
+        """
+        up_score = 0.0
+        down_score = 0.0
+
+        # ── Signal 1: Price (risk/reward) ──
+        # Prefer the cheaper side for better reaction margins, BUT hard-avoid
+        # any side priced below PRICE_AVOID_THRESHOLD — it's likely the loser
+        # and accumulating it creates unhedged exposure.
+        up_bid = up_best_bid if up_best_bid is not None else 0.50
+        down_bid = down_best_bid if down_best_bid is not None else 0.50
+        up_is_loser = up_bid < PRICE_AVOID_THRESHOLD
+        down_is_loser = down_bid < PRICE_AVOID_THRESHOLD
+        if up_is_loser and not down_is_loser:
+            up_price_score = 0.0
+            down_price_score = 1.0
+        elif down_is_loser and not up_is_loser:
+            up_price_score = 1.0
+            down_price_score = 0.0
+        elif up_is_loser and down_is_loser:
+            # Both very cheap (shouldn't happen in a binary), neutral
+            up_price_score = 0.5
+            down_price_score = 0.5
+        else:
+            # Both in competitive range — prefer cheaper side for reaction margin
+            bid_sum = up_bid + down_bid
+            if bid_sum > 0:
+                up_price_score = 1.0 - up_bid / bid_sum
+                down_price_score = 1.0 - down_bid / bid_sum
+            else:
+                up_price_score = 0.5
+                down_price_score = 0.5
+        up_score += SIDE_SCORE_PRICE_WEIGHT * up_price_score
+        down_score += SIDE_SCORE_PRICE_WEIGHT * down_price_score
+
+        # ── Signal 2: Inventory (prefer lighter side) ──
+        inv_total = up_inventory + down_inventory
+        if inv_total > 0:
+            up_inv_score = 1.0 - (up_inventory / inv_total)
+            down_inv_score = 1.0 - (down_inventory / inv_total)
+        else:
+            up_inv_score = 0.5
+            down_inv_score = 0.5
+        up_score += SIDE_SCORE_INVENTORY_WEIGHT * up_inv_score
+        down_score += SIDE_SCORE_INVENTORY_WEIGHT * down_inv_score
+
+        # ── Signal 3: Orderbook imbalance (prefer bullish side) ──
+        up_imb_score = (up_imbalance + 1.0) / 2.0
+        down_imb_score = (down_imbalance + 1.0) / 2.0
+        up_score += SIDE_SCORE_IMBALANCE_WEIGHT * up_imb_score
+        down_score += SIDE_SCORE_IMBALANCE_WEIGHT * down_imb_score
+
+        # ── Signal 4: Remaining capacity (prefer more room) ──
+        up_remaining = max(0.0, MAX_BOUGHT_PER_SIDE - up_total_bought)
+        down_remaining = max(0.0, MAX_BOUGHT_PER_SIDE - down_total_bought)
+        cap_total = up_remaining + down_remaining
+        if cap_total > 0:
+            up_cap_score = up_remaining / cap_total
+            down_cap_score = down_remaining / cap_total
+        else:
+            up_cap_score = 0.5
+            down_cap_score = 0.5
+        up_score += SIDE_SCORE_BOUGHT_WEIGHT * up_cap_score
+        down_score += SIDE_SCORE_BOUGHT_WEIGHT * down_cap_score
+
+        # ── Hysteresis: bonus for current active side ──
+        if self._active_side == "UP":
+            up_score += SIDE_SWITCH_THRESHOLD
+        elif self._active_side == "DOWN":
+            down_score += SIDE_SWITCH_THRESHOLD
+
+        # ── Stickiness: honour lock period ──
+        if self._active_side is not None and self._tick_count < self._side_locked_until_tick:
+            return self._active_side
+
+        chosen = "UP" if up_score >= down_score else "DOWN"
+
+        if self._active_side is None:
+            logger.info(
+                "[%s] Initial side selection: %s (up_score=%.3f down_score=%.3f)",
+                self.market.slug, chosen, up_score, down_score,
+            )
+            self._side_locked_until_tick = self._tick_count + SIDE_STICKINESS_TICKS
+        elif chosen != self._active_side:
+            logger.info(
+                "[%s] Side switch: %s -> %s (up_score=%.3f down_score=%.3f)",
+                self.market.slug, self._active_side, chosen, up_score, down_score,
+            )
+            self._side_locked_until_tick = self._tick_count + SIDE_STICKINESS_TICKS
+
+        self._active_side = chosen
+        return chosen
