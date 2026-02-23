@@ -12,6 +12,8 @@ import requests
 from py_clob_client import OpenOrderParams, TradeParams
 from py_clob_client.client import ClobClient, ApiCreds, OrderArgs, OrderType  # from py-clob-client
 
+from polymarket_apis import PolymarketDataClient, PolymarketGaslessWeb3Client
+
 from poly_maker_bot.config import ExchangeConfig
 from poly_maker_bot.metrics import RollingLatency, RateTracker
 
@@ -254,6 +256,13 @@ class PolymarketClient:
 
     # Rewards API configuration
     self._rewards_max_pages = int(os.environ.get("POLY_LP_REWARDS_MAX_PAGES", "4"))
+
+    # Web3 + data clients for on-chain operations (redeem, merge, etc.)
+    self._data_client = PolymarketDataClient()
+    self._web3_client = PolymarketGaslessWeb3Client(
+      private_key=private_key,
+      signature_type=2,  # Safe wallet
+    )
 
   def get_clob_api_creds(self) -> ApiCreds:
     """
@@ -1184,4 +1193,76 @@ class PolymarketClient:
     except Exception as e:
       logger.error(f"Failed to parse positions: {e}", exc_info=True)
       return []
-    
+
+  def redeem_all_positions(self) -> int:
+    """
+    Redeem all redeemable positions (resolved markets) into USDC.
+
+    Uses the polymarket-apis PolymarketDataClient to discover redeemable
+    positions, then PolymarketGaslessWeb3Client to execute on-chain redemptions.
+
+    Returns:
+      Number of positions successfully redeemed.
+    """
+    redeemed = 0
+    try:
+      user_address = self._funder
+      positions = self._data_client.get_positions(
+        user=user_address,
+        redeemable=True,
+        size_threshold=0.0,
+        limit=500,
+      )
+
+      if not positions:
+        logger.info("[REDEEM] No redeemable positions found")
+        return 0
+
+      logger.info(f"[REDEEM] Found {len(positions)} redeemable position(s)")
+
+      # Group by condition_id — each condition needs one redeem call
+      # with amounts for both outcomes
+      from collections import defaultdict
+      by_condition: dict[str, dict[int, float]] = defaultdict(dict)
+      neg_risk_map: dict[str, bool] = {}
+      for pos in positions:
+        by_condition[pos.condition_id][pos.outcome_index] = pos.size
+        neg_risk_map[pos.condition_id] = pos.negative_risk
+
+      for condition_id, outcomes in by_condition.items():
+        amounts = [outcomes.get(0, 0.0), outcomes.get(1, 0.0)]
+        neg_risk = neg_risk_map[condition_id]
+
+        try:
+          logger.info(
+            f"[REDEEM] Redeeming condition={condition_id[:12]}... "
+            f"amounts={amounts} neg_risk={neg_risk}"
+          )
+          receipt = self._web3_client.redeem_position(
+            condition_id=condition_id,
+            amounts=amounts,
+            neg_risk=neg_risk,
+          )
+          if receipt.status == 1:
+            redeemed += 1
+            logger.info(
+              f"[REDEEM] Success: condition={condition_id[:12]}... "
+              f"tx={receipt.tx_hash}"
+            )
+          else:
+            logger.warning(
+              f"[REDEEM] Failed on-chain: condition={condition_id[:12]}... "
+              f"tx={receipt.tx_hash}"
+            )
+        except Exception as e:
+          logger.error(
+            f"[REDEEM] Error redeeming condition={condition_id[:12]}...: {e}",
+            exc_info=True,
+          )
+
+    except Exception as e:
+      logger.error(f"[REDEEM] Error fetching redeemable positions: {e}", exc_info=True)
+
+    logger.info(f"[REDEEM] Completed: redeemed {redeemed} position(s)")
+    return redeemed
+

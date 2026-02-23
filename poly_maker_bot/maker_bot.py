@@ -142,6 +142,10 @@ class LiquidityProviderBot:
         self._lifecycle_stop = threading.Event()
         self._lifecycle_thread: Optional[threading.Thread] = None
 
+        # Periodic redeem management
+        self._redeem_stop = threading.Event()
+        self._redeem_thread: Optional[threading.Thread] = None
+
     def setup(self):
         """Initialize all bot components."""
         logger.info("==========================================")
@@ -273,6 +277,7 @@ class LiquidityProviderBot:
         try:
             self.setup()
             self._start_market_lifecycle()
+            self._start_redeem_loop()
 
             logger.info("Bot started successfully")
 
@@ -497,6 +502,33 @@ class LiquidityProviderBot:
         )
         self.ws_orderbook_client.start()
 
+    # ── Periodic redeem management ──────────────────────────────
+
+    REDEEM_INTERVAL_SEC = 30 * 60  # 30 minutes
+
+    def _start_redeem_loop(self) -> None:
+        """Spawn the periodic redeem daemon thread."""
+        self._redeem_stop.clear()
+        self._redeem_thread = threading.Thread(
+            target=self._redeem_loop,
+            name="redeem-positions",
+            daemon=True,
+        )
+        self._redeem_thread.start()
+        logger.info("Redeem loop thread started (interval=%ds)", self.REDEEM_INTERVAL_SEC)
+
+    def _redeem_loop(self) -> None:
+        """Background loop that redeems all resolved positions every 30 minutes."""
+        while not self._redeem_stop.is_set():
+            try:
+                redeemed = self.client.redeem_all_positions()
+                if redeemed > 0:
+                    logger.info("[REDEEM] Redeemed %d position(s) this cycle", redeemed)
+            except Exception:
+                logger.exception("Error in redeem loop")
+
+            self._redeem_stop.wait(timeout=self.REDEEM_INTERVAL_SEC)
+
     def _get_market_for_token(self, token_id: str) -> Optional[Market]:
         """Return the current market if it owns this token, else None."""
         m = self._current_market
@@ -705,6 +737,13 @@ class LiquidityProviderBot:
         self.running = False
 
         try:
+            # Stop redeem thread
+            self._redeem_stop.set()
+            if self._redeem_thread and self._redeem_thread.is_alive():
+                logger.info("Stopping redeem thread...")
+                self._redeem_thread.join(timeout=5.0)
+                logger.info("Redeem thread stopped")
+
             # Stop market lifecycle thread
             self._lifecycle_stop.set()
             if self._lifecycle_thread and self._lifecycle_thread.is_alive():
