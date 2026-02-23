@@ -1,0 +1,740 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>Poly Maker Bot</title>
+<style>
+  :root {
+    --bg: #0a0e14;
+    --surface: #131920;
+    --surface2: #1a2028;
+    --border: #252d38;
+    --text: #d4dae3;
+    --text-muted: #6b7a8d;
+    --text-dim: #3d4a58;
+    --green: #00e396;
+    --green-dim: rgba(0,227,150,0.12);
+    --red: #ff6178;
+    --red-dim: rgba(255,97,120,0.12);
+    --blue: #5ba0f5;
+    --blue-dim: rgba(91,160,245,0.12);
+    --yellow: #f5c542;
+    --yellow-dim: rgba(245,197,66,0.12);
+    --mono: 'SF Mono', 'Cascadia Code', 'Fira Code', 'JetBrains Mono', 'Consolas', monospace;
+    --sans: -apple-system, BlinkMacSystemFont, 'Segoe UI', 'Inter', sans-serif;
+    --radius: 10px;
+  }
+
+  * { margin: 0; padding: 0; box-sizing: border-box; }
+
+  body {
+    font-family: var(--sans);
+    background: var(--bg);
+    color: var(--text);
+    min-height: 100vh;
+    padding: 20px 24px;
+  }
+
+  /* ── Header ─────────────────────────────── */
+  header {
+    display: flex;
+    align-items: center;
+    justify-content: space-between;
+    margin-bottom: 20px;
+    padding-bottom: 16px;
+    border-bottom: 1px solid var(--border);
+  }
+  .logo {
+    display: flex;
+    align-items: center;
+    gap: 12px;
+  }
+  .logo h1 {
+    font-size: 18px;
+    font-weight: 600;
+    letter-spacing: 0.5px;
+  }
+  .logo .subtitle {
+    font-size: 12px;
+    color: var(--text-muted);
+    font-weight: 400;
+  }
+  .header-status {
+    display: flex;
+    align-items: center;
+    gap: 16px;
+    font-size: 13px;
+    color: var(--text-muted);
+  }
+  .status-badge {
+    display: flex;
+    align-items: center;
+    gap: 6px;
+    padding: 4px 10px;
+    border-radius: 20px;
+    font-size: 12px;
+    font-weight: 500;
+  }
+  .status-badge.online {
+    background: var(--green-dim);
+    color: var(--green);
+  }
+  .status-badge.offline {
+    background: var(--red-dim);
+    color: var(--red);
+  }
+  .dot {
+    width: 7px;
+    height: 7px;
+    border-radius: 50%;
+    animation: pulse 2s ease infinite;
+  }
+  .dot.green { background: var(--green); }
+  .dot.red { background: var(--red); }
+  @keyframes pulse {
+    0%, 100% { opacity: 1; }
+    50% { opacity: 0.4; }
+  }
+
+  /* ── Grid layout ────────────────────────── */
+  .grid {
+    display: grid;
+    grid-template-columns: 1fr 1fr;
+    gap: 16px;
+  }
+  .full { grid-column: 1 / -1; }
+
+  /* ── Cards ──────────────────────────────── */
+  .card {
+    background: var(--surface);
+    border: 1px solid var(--border);
+    border-radius: var(--radius);
+    padding: 16px 20px;
+  }
+  .card-title {
+    font-size: 11px;
+    font-weight: 600;
+    text-transform: uppercase;
+    letter-spacing: 1px;
+    color: var(--text-muted);
+    margin-bottom: 14px;
+  }
+
+  /* ── Summary cards ──────────────────────── */
+  .summary-row {
+    display: grid;
+    grid-template-columns: repeat(auto-fit, minmax(160px, 1fr));
+    gap: 12px;
+  }
+  .stat-card {
+    background: var(--surface2);
+    border-radius: 8px;
+    padding: 14px 16px;
+  }
+  .stat-label {
+    font-size: 11px;
+    color: var(--text-muted);
+    text-transform: uppercase;
+    letter-spacing: 0.8px;
+    margin-bottom: 6px;
+  }
+  .stat-value {
+    font-family: var(--mono);
+    font-size: 22px;
+    font-weight: 600;
+  }
+  .stat-sub {
+    font-size: 11px;
+    color: var(--text-muted);
+    margin-top: 4px;
+    font-family: var(--mono);
+  }
+  .positive { color: var(--green); }
+  .negative { color: var(--red); }
+  .neutral { color: var(--text); }
+
+  /* ── Market card ────────────────────────── */
+  .market-header {
+    display: flex;
+    justify-content: space-between;
+    align-items: center;
+    margin-bottom: 14px;
+  }
+  .market-slug {
+    font-family: var(--mono);
+    font-size: 14px;
+    font-weight: 500;
+  }
+  .market-timer {
+    font-family: var(--mono);
+    font-size: 16px;
+    font-weight: 600;
+    color: var(--yellow);
+  }
+  .progress-bar {
+    height: 4px;
+    background: var(--surface2);
+    border-radius: 2px;
+    margin-bottom: 16px;
+    overflow: hidden;
+  }
+  .progress-fill {
+    height: 100%;
+    background: linear-gradient(90deg, var(--blue), var(--green));
+    border-radius: 2px;
+    transition: width 1s linear;
+  }
+  .ob-row {
+    display: grid;
+    grid-template-columns: 1fr 1fr;
+    gap: 16px;
+  }
+  .ob-side {
+    background: var(--surface2);
+    border-radius: 8px;
+    padding: 12px 14px;
+  }
+  .ob-label {
+    font-size: 11px;
+    font-weight: 600;
+    text-transform: uppercase;
+    letter-spacing: 0.8px;
+    margin-bottom: 8px;
+  }
+  .ob-label.up { color: var(--green); }
+  .ob-label.down { color: var(--red); }
+  .ob-data {
+    font-family: var(--mono);
+    font-size: 13px;
+    line-height: 1.8;
+  }
+  .ob-data span { color: var(--text-muted); }
+
+  /* ── Tables ─────────────────────────────── */
+  table {
+    width: 100%;
+    border-collapse: collapse;
+  }
+  th {
+    font-size: 10px;
+    font-weight: 600;
+    text-transform: uppercase;
+    letter-spacing: 0.8px;
+    color: var(--text-muted);
+    text-align: left;
+    padding: 0 10px 10px;
+    border-bottom: 1px solid var(--border);
+  }
+  td {
+    font-family: var(--mono);
+    font-size: 12px;
+    padding: 8px 10px;
+    border-bottom: 1px solid rgba(37,45,56,0.5);
+    white-space: nowrap;
+  }
+  tr:last-child td { border-bottom: none; }
+  .text-right { text-align: right; }
+
+  /* ── Strategy card ──────────────────────── */
+  .strategy-grid {
+    display: grid;
+    grid-template-columns: 1fr 1fr;
+    gap: 10px;
+  }
+  .strategy-item {
+    background: var(--surface2);
+    border-radius: 6px;
+    padding: 10px 12px;
+  }
+  .strategy-item .label {
+    font-size: 10px;
+    color: var(--text-muted);
+    text-transform: uppercase;
+    letter-spacing: 0.6px;
+  }
+  .strategy-item .val {
+    font-family: var(--mono);
+    font-size: 14px;
+    font-weight: 500;
+    margin-top: 4px;
+  }
+
+  /* ── Metrics bar ────────────────────────── */
+  .metrics-row {
+    display: flex;
+    gap: 24px;
+    flex-wrap: wrap;
+  }
+  .metric-group {
+    display: flex;
+    align-items: center;
+    gap: 8px;
+    font-size: 12px;
+  }
+  .metric-group .label {
+    color: var(--text-muted);
+    font-weight: 500;
+  }
+  .metric-group .val {
+    font-family: var(--mono);
+    color: var(--text);
+  }
+
+  /* ── Empty state ────────────────────────── */
+  .empty {
+    text-align: center;
+    padding: 24px;
+    color: var(--text-dim);
+    font-size: 13px;
+  }
+
+  /* ── Scroll container ──────────────────── */
+  .scroll-y {
+    max-height: 260px;
+    overflow-y: auto;
+  }
+  .scroll-y::-webkit-scrollbar { width: 4px; }
+  .scroll-y::-webkit-scrollbar-track { background: transparent; }
+  .scroll-y::-webkit-scrollbar-thumb { background: var(--border); border-radius: 2px; }
+
+  /* ── Tag badges ─────────────────────────── */
+  .tag {
+    display: inline-block;
+    font-size: 10px;
+    font-weight: 600;
+    padding: 2px 6px;
+    border-radius: 4px;
+    text-transform: uppercase;
+    letter-spacing: 0.5px;
+  }
+  .tag.buy { background: var(--green-dim); color: var(--green); }
+  .tag.sell { background: var(--red-dim); color: var(--red); }
+  .tag.initial { background: var(--blue-dim); color: var(--blue); }
+  .tag.reaction { background: var(--yellow-dim); color: var(--yellow); }
+</style>
+</head>
+<body>
+
+<header>
+  <div class="logo">
+    <h1>Poly Maker Bot</h1>
+    <span class="subtitle">Dashboard</span>
+  </div>
+  <div class="header-status">
+    <span id="uptime" class="val"></span>
+    <div id="status-badge" class="status-badge offline">
+      <span class="dot red"></span>
+      Connecting...
+    </div>
+  </div>
+</header>
+
+<!-- Summary -->
+<div id="summary" class="summary-row" style="margin-bottom:16px"></div>
+
+<!-- Main grid -->
+<div class="grid">
+
+  <!-- Current Market -->
+  <div class="card full" id="market-card">
+    <div class="card-title">Current Market</div>
+    <div id="market-content" class="empty">Waiting for data...</div>
+  </div>
+
+  <!-- Positions -->
+  <div class="card full">
+    <div class="card-title">Positions</div>
+    <div id="positions-content" class="empty">No positions</div>
+  </div>
+
+  <!-- Open Orders -->
+  <div class="card">
+    <div class="card-title">Open Orders</div>
+    <div id="orders-content" class="empty">No open orders</div>
+  </div>
+
+  <!-- Strategy State -->
+  <div class="card">
+    <div class="card-title">Strategy</div>
+    <div id="strategy-content" class="empty">No active strategy</div>
+  </div>
+
+  <!-- PnL by Market -->
+  <div class="card full">
+    <div class="card-title">PnL by Market</div>
+    <div id="pnl-market-content" class="scroll-y empty">No market data yet</div>
+  </div>
+
+  <!-- Recent Trades -->
+  <div class="card full">
+    <div class="card-title">Recent Trades</div>
+    <div id="trades-content" class="scroll-y empty">No trades yet</div>
+  </div>
+
+  <!-- Metrics -->
+  <div class="card full">
+    <div class="card-title">Performance Metrics</div>
+    <div id="metrics-content" class="empty">No metrics</div>
+  </div>
+</div>
+
+<script>
+// ── State ──────────────────────────────────
+let currentMarket = null;
+let historicalData = {};
+
+// ── Helpers ────────────────────────────────
+function pnlClass(v) { return v > 0.0001 ? 'positive' : v < -0.0001 ? 'negative' : 'neutral'; }
+function pnlSign(v) { return v > 0 ? '+' : ''; }
+function fmt$(v, d=4) { return '$' + Number(v||0).toFixed(d); }
+function fmtPct(v) { return (v > 0 ? '+' : '') + Number(v||0).toFixed(2) + '%'; }
+function truncId(id) { return id ? id.slice(0,8) + '...' + id.slice(-4) : '?'; }
+function fmtTime(ts) {
+  if (!ts) return '-';
+  const d = new Date(ts * 1000);
+  return d.toLocaleTimeString('en-US', {hour:'2-digit', minute:'2-digit', second:'2-digit', hour12:false});
+}
+function fmtDate(ts) {
+  if (!ts) return '-';
+  const d = new Date(ts * 1000);
+  return d.toLocaleDateString('en-US', {month:'short', day:'numeric'}) + ' ' + fmtTime(ts);
+}
+function fmtDuration(sec) {
+  if (!sec || sec < 0) return '0s';
+  const h = Math.floor(sec / 3600);
+  const m = Math.floor((sec % 3600) / 60);
+  const s = Math.floor(sec % 60);
+  if (h > 0) return h + 'h ' + m + 'm';
+  if (m > 0) return m + 'm ' + s + 's';
+  return s + 's';
+}
+
+function tokenLabel(tokenId) {
+  if (!currentMarket) return truncId(tokenId);
+  if (tokenId === currentMarket.up_token_id) return 'UP';
+  if (tokenId === currentMarket.down_token_id) return 'DOWN';
+  return truncId(tokenId);
+}
+
+// ── SSE Connection ─────────────────────────
+function connect() {
+  const es = new EventSource('/api/stream');
+  es.onopen = () => {
+    document.getElementById('status-badge').className = 'status-badge online';
+    document.getElementById('status-badge').innerHTML = '<span class="dot green"></span>Live';
+  };
+  es.onmessage = (e) => {
+    try { updateRealtime(JSON.parse(e.data)); } catch(err) { console.error(err); }
+  };
+  es.onerror = () => {
+    document.getElementById('status-badge').className = 'status-badge offline';
+    document.getElementById('status-badge').innerHTML = '<span class="dot red"></span>Reconnecting...';
+    es.close();
+    setTimeout(connect, 3000);
+  };
+}
+
+// ── Initial Load ───────────────────────────
+fetch('/api/state')
+  .then(r => r.json())
+  .then(data => {
+    historicalData = data.historical || {};
+    updateRealtime(data);
+    updateHistorical(historicalData);
+    connect();
+  })
+  .catch(() => {
+    setTimeout(() => location.reload(), 5000);
+  });
+
+// ── Update Functions ───────────────────────
+
+function updateRealtime(data) {
+  currentMarket = data.current_market;
+  if (data.historical) {
+    historicalData = data.historical;
+    updateHistorical(historicalData);
+  }
+  updateUptime(data.uptime_sec);
+  updateSummary(data);
+  updateMarket(data.current_market, data.orderbook);
+  updatePositions(data.positions, data.pnl, data.orderbook);
+  updateOrders(data.open_orders);
+  updateStrategy(data.strategy);
+  updateMetrics(data.metrics);
+}
+
+function updateHistorical(hist) {
+  if (!hist) return;
+  updatePnlByMarket(hist.pnl_by_market);
+  updateTrades(hist.recent_trades);
+}
+
+function updateUptime(sec) {
+  document.getElementById('uptime').textContent = fmtDuration(sec);
+}
+
+function updateSummary(data) {
+  const pnl = data.pnl || {};
+  const totalUnrealized = pnl.total_unrealized || 0;
+  const realized = pnl.realized || 0;
+  const sessionPnl = realized + totalUnrealized;
+  const posCount = Object.keys(data.positions || {}).length;
+
+  const allTime = historicalData?.all_time_stats || {};
+  const allTimePnl = allTime.estimated_pnl || 0;
+  const allTimeTrades = allTime.total_trades || 0;
+  const marketsTraded = allTime.markets_traded || 0;
+
+  document.getElementById('summary').innerHTML = `
+    <div class="stat-card">
+      <div class="stat-label">All-Time PnL</div>
+      <div class="stat-value ${pnlClass(allTimePnl)}">${pnlSign(allTimePnl)}${fmt$(allTimePnl,2)}</div>
+      <div class="stat-sub">${allTimeTrades} trades</div>
+    </div>
+    <div class="stat-card">
+      <div class="stat-label">Session PnL</div>
+      <div class="stat-value ${pnlClass(sessionPnl)}">${pnlSign(sessionPnl)}${fmt$(sessionPnl,4)}</div>
+      <div class="stat-sub">realized ${pnlSign(realized)}${fmt$(realized,4)}</div>
+    </div>
+    <div class="stat-card">
+      <div class="stat-label">Unrealized</div>
+      <div class="stat-value ${pnlClass(totalUnrealized)}">${pnlSign(totalUnrealized)}${fmt$(totalUnrealized,4)}</div>
+      <div class="stat-sub">${posCount} position${posCount!==1?'s':''}</div>
+    </div>
+    <div class="stat-card">
+      <div class="stat-label">Markets Traded</div>
+      <div class="stat-value neutral">${marketsTraded}</div>
+      <div class="stat-sub">all time</div>
+    </div>
+  `;
+}
+
+function updateMarket(m, ob) {
+  const el = document.getElementById('market-content');
+  if (!m) { el.className = 'empty'; el.textContent = 'No active market'; return; }
+  el.className = '';
+
+  const elapsed = m.window_duration_sec - m.time_remaining_sec;
+  const pct = Math.min(100, (elapsed / m.window_duration_sec) * 100);
+  const timerColor = m.time_remaining_sec < 60 ? 'color:var(--red)' : '';
+
+  const upOb = ob?.[m.up_token_id] || {};
+  const dnOb = ob?.[m.down_token_id] || {};
+
+  el.innerHTML = `
+    <div class="market-header">
+      <div class="market-slug">${m.slug}</div>
+      <div class="market-timer" style="${timerColor}">${fmtDuration(m.time_remaining_sec)}</div>
+    </div>
+    <div class="progress-bar"><div class="progress-fill" style="width:${pct}%"></div></div>
+    <div class="ob-row">
+      <div class="ob-side">
+        <div class="ob-label up">UP Token</div>
+        <div class="ob-data">
+          Bid: ${upOb.best_bid != null ? upOb.best_bid.toFixed(3) : '-'} <span>(${(upOb.best_bid_size||0).toFixed(0)})</span><br>
+          Ask: ${upOb.best_ask != null ? upOb.best_ask.toFixed(3) : '-'} <span>(${(upOb.best_ask_size||0).toFixed(0)})</span><br>
+          Spread: <span>${upOb.spread != null ? (upOb.spread*100).toFixed(1)+'c' : '-'}</span>
+        </div>
+      </div>
+      <div class="ob-side">
+        <div class="ob-label down">DOWN Token</div>
+        <div class="ob-data">
+          Bid: ${dnOb.best_bid != null ? dnOb.best_bid.toFixed(3) : '-'} <span>(${(dnOb.best_bid_size||0).toFixed(0)})</span><br>
+          Ask: ${dnOb.best_ask != null ? dnOb.best_ask.toFixed(3) : '-'} <span>(${(dnOb.best_ask_size||0).toFixed(0)})</span><br>
+          Spread: <span>${dnOb.spread != null ? (dnOb.spread*100).toFixed(1)+'c' : '-'}</span>
+        </div>
+      </div>
+    </div>
+  `;
+}
+
+function updatePositions(positions, pnl, ob) {
+  const el = document.getElementById('positions-content');
+  const entries = Object.entries(positions || {});
+  if (entries.length === 0) { el.className = 'empty'; el.textContent = 'No positions'; return; }
+  el.className = '';
+
+  const unrealized = pnl?.unrealized_by_token || {};
+  const unrealizedPct = pnl?.unrealized_pct_by_token || {};
+
+  let html = '<table><thead><tr>' +
+    '<th>Token</th><th>Size</th><th>Avg Price</th><th>Cost Basis</th>' +
+    '<th>Cur Price</th><th class="text-right">PnL</th><th class="text-right">PnL %</th>' +
+    '</tr></thead><tbody>';
+
+  for (const [tid, pos] of entries) {
+    const pnlVal = unrealized[tid] || 0;
+    const pnlPctVal = unrealizedPct[tid] || 0;
+    const curOb = ob?.[tid] || {};
+    const curPrice = curOb.best_ask ?? curOb.best_bid ?? null;
+
+    html += `<tr>
+      <td>${tokenLabel(tid)}</td>
+      <td>${pos.size.toFixed(1)}</td>
+      <td>${fmt$(pos.avg_price)}</td>
+      <td>${fmt$(pos.cost_basis, 2)}</td>
+      <td>${curPrice != null ? fmt$(curPrice) : '-'}</td>
+      <td class="text-right ${pnlClass(pnlVal)}">${pnlSign(pnlVal)}${fmt$(pnlVal)}</td>
+      <td class="text-right ${pnlClass(pnlPctVal)}">${fmtPct(pnlPctVal)}</td>
+    </tr>`;
+  }
+  html += '</tbody></table>';
+  el.innerHTML = html;
+}
+
+function updateOrders(orders) {
+  const el = document.getElementById('orders-content');
+  const entries = Object.entries(orders || {});
+  if (entries.length === 0) { el.className = 'empty'; el.textContent = 'No open orders'; return; }
+  el.className = '';
+
+  let html = '<table><thead><tr><th>ID</th><th>Token</th><th>Side</th><th>Price</th><th>Size</th></tr></thead><tbody>';
+  for (const [oid, o] of entries) {
+    html += `<tr>
+      <td>${truncId(oid)}</td>
+      <td>${tokenLabel(o.token_id)}</td>
+      <td><span class="tag ${o.side?.toLowerCase()}">${o.side}</span></td>
+      <td>${fmt$(o.price)}</td>
+      <td>${Number(o.size).toFixed(1)}</td>
+    </tr>`;
+  }
+  html += '</tbody></table>';
+  el.innerHTML = html;
+}
+
+function updateStrategy(s) {
+  const el = document.getElementById('strategy-content');
+  if (!s) { el.className = 'empty'; el.textContent = 'No active strategy'; return; }
+  el.className = '';
+
+  const fillEntries = Object.entries(s.pending_fill_size || {});
+  const fillStr = fillEntries.length > 0
+    ? fillEntries.map(([tid, sz]) => `${tokenLabel(tid)}: ${sz.toFixed(1)}`).join(', ')
+    : 'None';
+
+  el.innerHTML = `
+    <div class="strategy-grid">
+      <div class="strategy-item">
+        <div class="label">Status</div>
+        <div class="val" style="color:${s.running ? 'var(--green)' : 'var(--red)'}">${s.running ? 'Running' : 'Stopped'}</div>
+      </div>
+      <div class="strategy-item">
+        <div class="label">Market</div>
+        <div class="val">${s.market_slug || '-'}</div>
+      </div>
+      <div class="strategy-item">
+        <div class="label">Pending Reactions</div>
+        <div class="val">${s.pending_reactions ?? 0}</div>
+      </div>
+      <div class="strategy-item">
+        <div class="label">Fill Accumulator</div>
+        <div class="val">${fillStr}</div>
+      </div>
+    </div>
+  `;
+}
+
+function updatePnlByMarket(pnlByMarket) {
+  const el = document.getElementById('pnl-market-content');
+  if (!pnlByMarket || pnlByMarket.length === 0) {
+    el.className = 'scroll-y empty';
+    el.textContent = 'No market data yet';
+    return;
+  }
+  el.className = 'scroll-y';
+
+  let html = '<table><thead><tr>' +
+    '<th>Market</th><th class="text-right">Trades</th>' +
+    '<th class="text-right">Volume</th><th class="text-right">Est. PnL</th>' +
+    '</tr></thead><tbody>';
+
+  for (const m of pnlByMarket) {
+    const pnlVal = m.estimated_pnl || 0;
+    html += `<tr>
+      <td>${m.market_slug}</td>
+      <td class="text-right">${m.trade_count}</td>
+      <td class="text-right">${fmt$(m.total_volume, 2)}</td>
+      <td class="text-right ${pnlClass(pnlVal)}">${pnlSign(pnlVal)}${fmt$(pnlVal, 4)}</td>
+    </tr>`;
+  }
+  html += '</tbody></table>';
+  el.innerHTML = html;
+}
+
+function updateTrades(trades) {
+  const el = document.getElementById('trades-content');
+  if (!trades || trades.length === 0) {
+    el.className = 'scroll-y empty';
+    el.textContent = 'No trades yet';
+    return;
+  }
+  el.className = 'scroll-y';
+
+  let html = '<table><thead><tr>' +
+    '<th>Time</th><th>Market</th><th>Side</th><th>Size</th>' +
+    '<th>Price</th><th class="text-right">USDC</th><th>Type</th><th>Tx</th>' +
+    '</tr></thead><tbody>';
+
+  for (const t of trades.slice(0, 50)) {
+    const typeTag = (t.order_type || '').includes('reaction') ? 'reaction' : 'initial';
+    const txLink = t.transaction_hash
+      ? `<a href="https://polygonscan.com/tx/${t.transaction_hash}" target="_blank" rel="noopener" style="color:var(--blue);text-decoration:none">${t.transaction_hash.slice(0,6)}...${t.transaction_hash.slice(-4)}</a>`
+      : '<span style="color:var(--text-dim)">pending</span>';
+    html += `<tr>
+      <td>${fmtDate(t.created_at)}</td>
+      <td>${t.market_slug}</td>
+      <td><span class="tag ${(t.side||'').toLowerCase()}">${t.side}</span></td>
+      <td>${Number(t.size).toFixed(1)}</td>
+      <td>${fmt$(t.price)}</td>
+      <td class="text-right">${fmt$(t.usdc_value, 2)}</td>
+      <td><span class="tag ${typeTag}">${typeTag}</span></td>
+      <td>${txLink}</td>
+    </tr>`;
+  }
+  html += '</tbody></table>';
+  el.innerHTML = html;
+}
+
+function updateMetrics(metrics) {
+  const el = document.getElementById('metrics-content');
+  if (!metrics || Object.keys(metrics).length === 0) { el.className = 'empty'; el.textContent = 'No metrics'; return; }
+  el.className = '';
+
+  const postLat = metrics.post_order_latency || {};
+  const delLat = metrics.delete_order_latency || {};
+  const postRate = metrics.post_order_rate || {};
+  const delRate = metrics.delete_order_rate || {};
+
+  function latStr(lat) {
+    if (!lat || !lat.n) return '-';
+    return `p50=${lat.p50_ms?.toFixed(0)||'-'}ms  p95=${lat.p95_ms?.toFixed(0)||'-'}ms  p99=${lat.p99_ms?.toFixed(0)||'-'}ms  (n=${lat.n})`;
+  }
+
+  el.innerHTML = `
+    <div class="metrics-row">
+      <div class="metric-group">
+        <span class="label">POST Order:</span>
+        <span class="val">${latStr(postLat)}</span>
+      </div>
+      <div class="metric-group">
+        <span class="label">Rate:</span>
+        <span class="val">${postRate.avg_per_min?.toFixed(1) || '-'}/min</span>
+      </div>
+    </div>
+    <div class="metrics-row" style="margin-top:8px">
+      <div class="metric-group">
+        <span class="label">Cancel Order:</span>
+        <span class="val">${latStr(delLat)}</span>
+      </div>
+      <div class="metric-group">
+        <span class="label">Rate:</span>
+        <span class="val">${delRate.avg_per_min?.toFixed(1) || '-'}/min</span>
+      </div>
+    </div>
+  `;
+}
+</script>
+</body>
+</html>

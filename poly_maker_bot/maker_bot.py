@@ -59,6 +59,8 @@ from poly_maker_bot.utils import (
 from poly_maker_bot.market.discovery import discover_market, Market
 from poly_maker_bot.strategy import StrategyEngine, SimpleMarketMaker
 from poly_maker_bot.utils.slug_helpers import Underlying, Timespan
+from poly_maker_bot.db import TradeDatabase
+from poly_maker_bot.dashboard import DashboardServer
 
 # Create default bot config from environment variables
 DEFAULT_BOT_CONFIG = BotConfig()
@@ -146,6 +148,11 @@ class LiquidityProviderBot:
         self._redeem_stop = threading.Event()
         self._redeem_thread: Optional[threading.Thread] = None
 
+        # Database and dashboard
+        self.db = TradeDatabase()
+        self.session_id = self.db.start_session()
+        self._dashboard: Optional[DashboardServer] = None
+
     def setup(self):
         """Initialize all bot components."""
         logger.info("==========================================")
@@ -196,6 +203,12 @@ class LiquidityProviderBot:
             logger.error(f"Failed to start trade client: {e}", exc_info=True)
             logger.warning("Trade WebSocket unavailable - fill detection will not work")
             self.ws_trade_client = None
+
+        # Start dashboard if port configured
+        dashboard_port = int(os.environ.get("POLY_DASHBOARD_PORT", "0"))
+        if dashboard_port > 0:
+            self._dashboard = DashboardServer(self, self.db, port=dashboard_port)
+            self._dashboard.start()
 
         logger.info("==========================================")
         logger.info("⚙️ Bot setup complete ✅")
@@ -422,6 +435,9 @@ class LiquidityProviderBot:
         else:
             self._init_orderbook_client(token_ids)
 
+        # Record market in DB
+        self.db.record_market(market)
+
         # Create and start strategy
         self._strategy = SimpleMarketMaker(
             market=market,
@@ -614,6 +630,20 @@ class LiquidityProviderBot:
                 )
 
                 self._route_fill_to_strategy(asset_id, side, price, size, order_id=taker_order_id, trade_id=trade_id, status=status)
+
+                # Record to DB
+                if status == "MATCHED" and trade_id:
+                    self.db.record_trade(
+                        trade_id=trade_id, order_id=taker_order_id or "",
+                        token_id=asset_id, market_slug=market_slug,
+                        side=side, size=size, price=price,
+                        outcome=outcome,
+                        order_type=self.order_manager.get_order_type(taker_order_id) if taker_order_id else None,
+                        status=status,
+                        transaction_hash=transaction_hash,
+                    )
+                elif status in ("CONFIRMED", "FAILED") and trade_id:
+                    self.db.update_trade_status(trade_id, status, transaction_hash=transaction_hash)
             else:
                 # Process maker orders if we weren't the taker
                 # Process each maker order fill
@@ -658,6 +688,20 @@ class LiquidityProviderBot:
                     )
 
                     self._route_fill_to_strategy(asset_id, side, price, size, order_id=order_id, trade_id=trade_id, status=status)
+
+                    # Record to DB
+                    if status == "MATCHED" and trade_id:
+                        self.db.record_trade(
+                            trade_id=trade_id, order_id=order_id or "",
+                            token_id=asset_id, market_slug=market_slug,
+                            side=side, size=size, price=price,
+                            outcome=outcome,
+                            order_type=self.order_manager.get_order_type(order_id) if order_id else None,
+                            status=status,
+                            transaction_hash=transaction_hash,
+                        )
+                    elif status in ("CONFIRMED", "FAILED") and trade_id:
+                        self.db.update_trade_status(trade_id, status, transaction_hash=transaction_hash)
 
         except Exception as e:
             logger.error(f"[WS-TRADE] Error processing trade message: {e}", exc_info=True)
@@ -781,6 +825,13 @@ class LiquidityProviderBot:
                 logger.info("Stopping WebSocket trade client...")
                 self.ws_trade_client.stop()
                 logger.info("WebSocket trade client stopped")
+
+            # Stop dashboard and finalize DB session
+            if self._dashboard:
+                self._dashboard.stop()
+            trade_count = len(self.db.get_recent_trades(limit=10000))
+            self.db.end_session(self.session_id, self.realized_pnl, trade_count)
+            self.db.close()
 
             logger.info("Shutdown complete")
         except Exception as e:
