@@ -4,3 +4,6 @@ __pycache__/
 .env
 .env*
 .bot_data*
+bot_data.db
+bot_data.db-shm
+bot_data.db-wal
