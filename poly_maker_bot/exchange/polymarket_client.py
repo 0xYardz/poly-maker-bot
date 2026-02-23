@@ -259,9 +259,19 @@ class PolymarketClient:
 
     # Web3 + data clients for on-chain operations (redeem, merge, etc.)
     self._data_client = PolymarketDataClient()
+    builder_key = os.environ.get(cfg.builder_api_key_env)
+    builder_secret = os.environ.get(cfg.builder_secret_env)
+    builder_passphrase = os.environ.get(cfg.builder_passphrase_env)
+    builder_creds = None
+    if builder_key and builder_secret and builder_passphrase:
+      from polymarket_apis.types.clob_types import ApiCreds as BuilderApiCreds
+      builder_creds = BuilderApiCreds(
+        key=builder_key, secret=builder_secret, passphrase=builder_passphrase
+      )
     self._web3_client = PolymarketGaslessWeb3Client(
       private_key=private_key,
       signature_type=2,  # Safe wallet
+      builder_creds=builder_creds,
     )
 
   def get_clob_api_creds(self) -> ApiCreds:
@@ -1207,27 +1217,37 @@ class PolymarketClient:
     redeemed = 0
     try:
       user_address = self._funder
-      positions = self._data_client.get_positions(
-        user=user_address,
-        redeemable=True,
-        size_threshold=0.0,
-        limit=500,
-      )
 
-      if not positions:
+      # Query the data API directly (more reliable than the library client
+      # which always sends mergeable=False alongside redeemable=True)
+      url = "https://data-api.polymarket.com/positions"
+      params: dict[str, Any] = {
+        "user": user_address,
+        "redeemable": "true",
+        "sizeThreshold": 0,
+        "limit": 500,
+        "sortBy": "TOKENS",
+        "sortDirection": "DESC",
+      }
+      response = requests.get(url, params=params, timeout=10)
+      response.raise_for_status()
+      raw_positions = response.json()
+
+      if not raw_positions:
         logger.info("[REDEEM] No redeemable positions found")
         return 0
 
-      logger.info(f"[REDEEM] Found {len(positions)} redeemable position(s)")
+      logger.info(f"[REDEEM] Found {len(raw_positions)} redeemable position(s)")
 
       # Group by condition_id — each condition needs one redeem call
       # with amounts for both outcomes
       from collections import defaultdict
       by_condition: dict[str, dict[int, float]] = defaultdict(dict)
       neg_risk_map: dict[str, bool] = {}
-      for pos in positions:
-        by_condition[pos.condition_id][pos.outcome_index] = pos.size
-        neg_risk_map[pos.condition_id] = pos.negative_risk
+      for pos in raw_positions:
+        cid = pos.get("conditionId", "")
+        by_condition[cid][int(pos.get("outcomeIndex", 0))] = float(pos.get("size", 0))
+        neg_risk_map[cid] = pos.get("negativeRisk", True)
 
       for condition_id, outcomes in by_condition.items():
         amounts = [outcomes.get(0, 0.0), outcomes.get(1, 0.0)]
