@@ -204,6 +204,20 @@ class PositionTracker:
             pos = self.positions.get(token_id)
             return pos is not None and pos["size"] >= self.dust_threshold
 
+    def remove_tokens(self, token_ids: list[str]) -> int:
+        """Remove positions for the given token IDs.
+
+        Returns:
+            Number of positions removed
+        """
+        with self._lock:
+            removed = 0
+            for tid in token_ids:
+                if tid in self.positions:
+                    del self.positions[tid]
+                    removed += 1
+            return removed
+
     def remove_dust_positions(self) -> int:
         """
         Remove positions below dust threshold.

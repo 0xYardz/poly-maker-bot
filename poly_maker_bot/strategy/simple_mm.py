@@ -231,6 +231,9 @@ class SimpleMarketMaker(StrategyEngine):
 
         # ── Handle non-MATCHED statuses (confirmation / failure updates) ──
         if status != "MATCHED":
+            # Remove confirmed orders from open-orders tracking
+            if status in _CONFIRMED_STATUSES and order_id:
+                self.order_manager.remove_order(order_id)
             self._handle_trade_status_update(trade_id, status)
             return
 
@@ -246,7 +249,11 @@ class SimpleMarketMaker(StrategyEngine):
             market_slug=self.market.slug,
         )
 
-        # Only place reaction orders for initial order fills
+        # Only place reaction orders for initial order fills.
+        # NOTE: Do NOT remove_order here — partial fills arrive as multiple
+        # MATCHED events for the same order_id, and removing on the first
+        # partial would cause subsequent partials to lose their order_type,
+        # falling through to the reaction logic incorrectly.
         if order_id:
             order_type = self.order_manager.get_order_type(order_id)
             if order_type and order_type != _OT_INITIAL:

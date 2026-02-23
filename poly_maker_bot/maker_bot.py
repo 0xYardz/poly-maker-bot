@@ -57,8 +57,10 @@ from poly_maker_bot.utils import (
     round_to_tick,
 )
 from poly_maker_bot.market.discovery import discover_market, Market
-from poly_maker_bot.strategy import StrategyEngine, SimpleMarketMaker
+from poly_maker_bot.strategy import StrategyEngine, SimpleMarketMaker, VolatileMarketMaker
 from poly_maker_bot.utils.slug_helpers import Underlying, Timespan
+from poly_maker_bot.db import TradeDatabase
+from poly_maker_bot.dashboard import DashboardServer
 
 # Create default bot config from environment variables
 DEFAULT_BOT_CONFIG = BotConfig()
@@ -67,6 +69,7 @@ logger = logging.getLogger(__name__)
 # Market targeting from .env (defaults: btc / 15m)
 UNDERLYING: Underlying = os.environ.get("POLY_UNDERLYING", "btc")  # type: ignore[assignment]
 TIMESPAN: Timespan = os.environ.get("POLY_TIMESPAN", "15m")  # type: ignore[assignment]
+STRATEGY: str = os.environ.get("POLY_STRATEGY", "simple_mm")  # "simple_mm" or "volatile_mm"
 
 
 class LiquidityProviderBot:
@@ -146,6 +149,11 @@ class LiquidityProviderBot:
         self._redeem_stop = threading.Event()
         self._redeem_thread: Optional[threading.Thread] = None
 
+        # Database and dashboard
+        self.db = TradeDatabase()
+        self.session_id = self.db.start_session()
+        self._dashboard: Optional[DashboardServer] = None
+
     def setup(self):
         """Initialize all bot components."""
         logger.info("==========================================")
@@ -196,6 +204,12 @@ class LiquidityProviderBot:
             logger.error(f"Failed to start trade client: {e}", exc_info=True)
             logger.warning("Trade WebSocket unavailable - fill detection will not work")
             self.ws_trade_client = None
+
+        # Start dashboard if port configured
+        dashboard_port = int(os.environ.get("POLY_DASHBOARD_PORT", "0"))
+        if dashboard_port > 0:
+            self._dashboard = DashboardServer(self, self.db, port=dashboard_port)
+            self._dashboard.start()
 
         logger.info("==========================================")
         logger.info("⚙️ Bot setup complete ✅")
@@ -422,8 +436,11 @@ class LiquidityProviderBot:
         else:
             self._init_orderbook_client(token_ids)
 
+        # Record market in DB
+        self.db.record_market(market)
+
         # Create and start strategy
-        self._strategy = SimpleMarketMaker(
+        strategy_kwargs = dict(
             market=market,
             client=self.client,
             order_placer=self.order_placer,
@@ -431,6 +448,12 @@ class LiquidityProviderBot:
             position_tracker=self.position_tracker,
             orderbook_stores=self.orderbook_stores,
         )
+        if STRATEGY == "volatile_mm":
+            self._strategy = VolatileMarketMaker(**strategy_kwargs)
+            logger.info("Using VolatileMarketMaker strategy")
+        else:
+            self._strategy = SimpleMarketMaker(**strategy_kwargs)
+            logger.info("Using SimpleMarketMaker strategy")
         self._strategy.start()
 
         logger.info("Market activated: %s", market.slug)
@@ -461,6 +484,11 @@ class LiquidityProviderBot:
 
         if old_market:
             self._deactivate_market(old_market)
+            # Clear stale positions from ended market so dashboard stays clean
+            old_tokens = [old_market.up_token_id, old_market.down_token_id]
+            removed = self.position_tracker.remove_tokens(old_tokens)
+            if removed:
+                logger.info("Cleared %d position(s) from ended market %s", removed, old_market.slug)
 
         if new_market is None:
             # Pre-fetch failed earlier — try again synchronously
@@ -504,7 +532,7 @@ class LiquidityProviderBot:
 
     # ── Periodic redeem management ──────────────────────────────
 
-    REDEEM_INTERVAL_SEC = 30 * 60  # 30 minutes
+    REDEEM_INTERVAL_SEC = 7 * 60  # 7 minutes
 
     def _start_redeem_loop(self) -> None:
         """Spawn the periodic redeem daemon thread."""
@@ -518,7 +546,7 @@ class LiquidityProviderBot:
         logger.info("Redeem loop thread started (interval=%ds)", self.REDEEM_INTERVAL_SEC)
 
     def _redeem_loop(self) -> None:
-        """Background loop that redeems all resolved positions every 30 minutes."""
+        """Background loop that redeems all resolved positions and checks market resolutions."""
         while not self._redeem_stop.is_set():
             try:
                 redeemed = self.client.redeem_all_positions()
@@ -527,7 +555,63 @@ class LiquidityProviderBot:
             except Exception:
                 logger.exception("Error in redeem loop")
 
+            # Check resolution for ended markets that we haven't recorded yet
+            try:
+                self._check_market_resolutions()
+            except Exception:
+                logger.exception("Error checking market resolutions")
+
             self._redeem_stop.wait(timeout=self.REDEEM_INTERVAL_SEC)
+
+    def _check_market_resolutions(self) -> None:
+        """Query Gamma API for unresolved ended markets and record winners."""
+        import json as _json
+
+        unresolved = self.db.get_unresolved_markets()
+        if not unresolved:
+            return
+
+        for mkt in unresolved:
+            slug = mkt["slug"]
+            try:
+                raw = self.client.get_market_by_slug(slug)
+                if not raw:
+                    continue
+
+                closed = raw.get("closed", False)
+                if not closed:
+                    continue
+
+                # Parse outcome_prices and clobTokenIds to find winner
+                prices_raw = raw.get("outcomePrices", raw.get("outcome_prices", ""))
+                tokens_raw = raw.get("clobTokenIds", raw.get("clob_token_ids", ""))
+
+                prices = _json.loads(prices_raw) if isinstance(prices_raw, str) else prices_raw
+                tokens = _json.loads(tokens_raw) if isinstance(tokens_raw, str) else tokens_raw
+
+                if not prices or not tokens or len(prices) != len(tokens):
+                    continue
+
+                # Find which outcome resolved to 1.0
+                up_tid = mkt["up_token_id"]
+                down_tid = mkt["down_token_id"]
+                winner = None
+
+                for tid, price_str in zip(tokens, prices):
+                    p = float(price_str)
+                    if p >= 0.99:  # resolved to $1.00
+                        if tid == up_tid:
+                            winner = "UP"
+                        elif tid == down_tid:
+                            winner = "DOWN"
+                        break
+
+                if winner:
+                    self.db.set_market_resolution(slug, winner)
+                    logger.info("[RESOLUTION] %s resolved: %s won", slug, winner)
+
+            except Exception:
+                logger.exception("Error checking resolution for %s", slug)
 
     def _get_market_for_token(self, token_id: str) -> Optional[Market]:
         """Return the current market if it owns this token, else None."""
@@ -614,6 +698,21 @@ class LiquidityProviderBot:
                 )
 
                 self._route_fill_to_strategy(asset_id, side, price, size, order_id=taker_order_id, trade_id=trade_id, status=status)
+
+                # Record to DB
+                if status == "MATCHED" and trade_id:
+                    self.db.record_trade(
+                        trade_id=trade_id, order_id=taker_order_id or "",
+                        token_id=asset_id, market_slug=market_slug,
+                        side=side, size=size, price=price,
+                        outcome=outcome,
+                        order_type=self.order_manager.get_order_type(taker_order_id) if taker_order_id else None,
+                        status=status,
+                        transaction_hash=transaction_hash,
+                        strategy=STRATEGY,
+                    )
+                elif status in ("CONFIRMED", "FAILED") and trade_id:
+                    self.db.update_trade_status(trade_id, status, transaction_hash=transaction_hash)
             else:
                 # Process maker orders if we weren't the taker
                 # Process each maker order fill
@@ -658,6 +757,21 @@ class LiquidityProviderBot:
                     )
 
                     self._route_fill_to_strategy(asset_id, side, price, size, order_id=order_id, trade_id=trade_id, status=status)
+
+                    # Record to DB
+                    if status == "MATCHED" and trade_id:
+                        self.db.record_trade(
+                            trade_id=trade_id, order_id=order_id or "",
+                            token_id=asset_id, market_slug=market_slug,
+                            side=side, size=size, price=price,
+                            outcome=outcome,
+                            order_type=self.order_manager.get_order_type(order_id) if order_id else None,
+                            status=status,
+                            transaction_hash=transaction_hash,
+                            strategy=STRATEGY,
+                        )
+                    elif status in ("CONFIRMED", "FAILED") and trade_id:
+                        self.db.update_trade_status(trade_id, status, transaction_hash=transaction_hash)
 
         except Exception as e:
             logger.error(f"[WS-TRADE] Error processing trade message: {e}", exc_info=True)
@@ -781,6 +895,13 @@ class LiquidityProviderBot:
                 logger.info("Stopping WebSocket trade client...")
                 self.ws_trade_client.stop()
                 logger.info("WebSocket trade client stopped")
+
+            # Stop dashboard and finalize DB session
+            if self._dashboard:
+                self._dashboard.stop()
+            trade_count = len(self.db.get_recent_trades(limit=10000))
+            self.db.end_session(self.session_id, self.realized_pnl, trade_count)
+            self.db.close()
 
             logger.info("Shutdown complete")
         except Exception as e:
