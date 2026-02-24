@@ -28,13 +28,13 @@ _OT_FILL_REACTION = "fill_reaction_buy"
 MAX_ORDER_SIZE = 10.0           # max shares per single order
 MIN_ORDER_SIZE = 5.0            # exchange minimum
 MAX_IMBALANCE = 14.0            # max net imbalance (this_side - opposite_side)
-MAX_BOUGHT_PER_SIDE = 60.0     # max total shares bought per token across the session
+MAX_BOUGHT_PER_SIDE = 300.0     # max total shares bought per token across the session
 
-NUM_LAYERS = 2                 # number of BUY orders per token
-LAYER_SPACING = 0.02            # 1c between layers (before volatility adjustment)
+NUM_LAYERS = 3                 # number of BUY orders per token
+LAYER_SPACING = 0.01            # 1c between layers (before volatility adjustment)
 TICK_SIZE = 0.01                # price tick size
 
-CANCEL_BEFORE_END_SEC = 15      # cancel unfilled orders with <15s left
+CANCEL_BEFORE_END_SEC = 45      # cancel unfilled orders with <45s left
 CONFIRM_TIMEOUT_SEC = 30.0      # cancel reaction if trade not confirmed
 
 STALE_PRICE_THRESHOLD = 0.005   # cancel/replace if target price drifted >0.5c
@@ -857,20 +857,13 @@ class VolatileMarketMaker(StrategyEngine):
         if self._active_side is not None and self._tick_count < self._side_locked_until_tick:
             return self._active_side
 
-        chosen = "UP" if up_score >= down_score else "DOWN"
+        chosen = "UP"
 
         if self._active_side is None:
             logger.info(
-                "[%s] Initial side selection: %s (up_score=%.3f down_score=%.3f)",
-                self.market.slug, chosen, up_score, down_score,
+                "[%s] Side forced to UP (up_score=%.3f down_score=%.3f)",
+                self.market.slug, up_score, down_score,
             )
-            self._side_locked_until_tick = self._tick_count + SIDE_STICKINESS_TICKS
-        elif chosen != self._active_side:
-            logger.info(
-                "[%s] Side switch: %s -> %s (up_score=%.3f down_score=%.3f)",
-                self.market.slug, self._active_side, chosen, up_score, down_score,
-            )
-            self._side_locked_until_tick = self._tick_count + SIDE_STICKINESS_TICKS
 
         self._active_side = chosen
         return chosen
