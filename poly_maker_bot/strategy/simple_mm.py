@@ -341,7 +341,7 @@ class SimpleMarketMaker(StrategyEngine):
         if not matching:
             return
 
-        if status in _CONFIRMED_STATUSES:
+        if status == "CONFIRMED":
             for rid, pr in matching:
                 if pr.cancelled_for_retry:
                     # Trade confirmed after a RETRYING — re-place the reaction order
@@ -387,6 +387,10 @@ class SimpleMarketMaker(StrategyEngine):
                     pr.cancelled_for_retry = True
 
         elif status == "FAILED":
+            logger.info(
+                "[%s] Trade %s FAILED — cancelling reaction orders",
+                self.market.slug, trade_id[:12],
+            )
             for rid, pr in matching:
                 logger.warning(
                     "[%s] Trade %s FAILED — cancelling reaction order %s",
