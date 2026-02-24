@@ -2,6 +2,7 @@
 from __future__ import annotations
 
 import logging
+import os
 import threading
 import time
 from dataclasses import dataclass, field
@@ -26,7 +27,7 @@ _OT_FILL_REACTION = "fill_reaction_buy"
 # Strategy constants
 INITIAL_BUY_PRICE = 0.03   # 3c
 REACTION_BUY_PRICE = 0.96  # 96c
-ORDER_SIZE = 100.0          # 100 shares
+ORDER_SIZE = float(os.environ.get("POLY_ORDER_SIZE", "100.0"))  # shares
 MIN_ORDER_SIZE = 5.0        # exchange minimum order size
 CANCEL_BEFORE_END_SEC = 60  # cancel unfilled initial orders with <1 min left
 CONFIRM_TIMEOUT_SEC = 30.0  # cancel reaction if trade not MINED/CONFIRMED within this window
