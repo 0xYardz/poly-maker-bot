@@ -277,7 +277,7 @@ class PolymarketClient:
     logger.info("Initialized PolymarketClient with RPC URL: %s", polygon_rpc_url)
     self._web3_gas_client = PolymarketWeb3Client(
       private_key=private_key,
-      signature_type=0,  # Safe wallet
+      signature_type=2,  # Safe wallet
       rpc_url=polygon_rpc_url,
     )
 
