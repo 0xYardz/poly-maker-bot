@@ -119,6 +119,15 @@ class OrderManager:
         with self._lock:
             return self.order_types.get(order_id)
 
+    def preserve_order_type(self, order_id: str, order_type: str) -> None:
+        """Re-insert an order type after remove_order has cleared it.
+
+        Used when an order is removed from open_orders tracking but we still
+        need to recognise its type for late-arriving MATCHED partials.
+        """
+        with self._lock:
+            self.order_types[order_id] = order_type
+
     def update_order_size(self, order_id: str, new_size: float) -> None:
         """Update the size of an order."""
         with self._lock:
