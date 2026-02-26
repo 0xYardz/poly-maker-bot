@@ -1,6 +1,7 @@
 """Simple market-making strategy for 15m up/down markets."""
 from __future__ import annotations
 
+import json
 import logging
 import os
 import threading
@@ -25,10 +26,43 @@ _OT_INITIAL = "initial_buy"
 _OT_FILL_REACTION = "fill_reaction_buy"
 
 # Strategy constants
-INITIAL_BUY_PRICE = float(os.environ.get("POLY_INITIAL_BUY_PRICE", "0.03"))   # 3c
-REACTION_BUY_PRICE = float(os.environ.get("POLY_REACTION_BUY_PRICE", "0.96"))  # 96c
-ORDER_SIZE = float(os.environ.get("POLY_ORDER_SIZE", "100.0"))  # shares
 MIN_ORDER_SIZE = 5.0        # exchange minimum order size
+
+
+@dataclass(frozen=True)
+class BuyPair:
+    """One (initial_price, reaction_price, size) configuration tuple."""
+    index: int
+    initial_price: float
+    reaction_price: float
+    size: float
+
+
+def _load_buy_pairs() -> list[BuyPair]:
+    """Load buy pairs from POLY_BUY_PAIRS (JSON) or legacy scalar env vars."""
+    raw = os.environ.get("POLY_BUY_PAIRS")
+    if raw:
+        entries = json.loads(raw)
+        return [
+            BuyPair(
+                index=i,
+                initial_price=float(e["initial"]),
+                reaction_price=float(e["reaction"]),
+                size=float(e["size"]),
+            )
+            for i, e in enumerate(entries)
+        ]
+    return [
+        BuyPair(
+            index=0,
+            initial_price=float(os.environ.get("POLY_INITIAL_BUY_PRICE", "0.03")),
+            reaction_price=float(os.environ.get("POLY_REACTION_BUY_PRICE", "0.96")),
+            size=float(os.environ.get("POLY_ORDER_SIZE", "100.0")),
+        )
+    ]
+
+
+BUY_PAIRS: list[BuyPair] = _load_buy_pairs()
 CANCEL_BEFORE_END_SEC = int(os.environ.get("POLY_CANCEL_BEFORE_END_SEC", "60"))  # cancel unfilled initial orders with <1 min left
 CONFIRM_TIMEOUT_SEC = 30.0  # cancel reaction if trade not MINED/CONFIRMED within this window
 
@@ -44,6 +78,7 @@ class _PendingReaction:
     opposite_token: str        # token_id for the reaction order
     opposite_label: str        # "UP" or "DOWN"
     reaction_size: float       # size of the reaction order
+    reaction_price: float      # price for the reaction order (from BuyPair)
     trade_ids: set[str] = field(default_factory=set)
     confirmed: bool = False
     cancelled_for_retry: bool = False  # True if cancelled due to RETRYING
@@ -53,10 +88,13 @@ class SimpleMarketMaker(StrategyEngine):
     """
     Two-sided market maker for a 15m up/down binary market.
 
-    Strategy:
-    - On start, place a 3c BUY order on both the Up and Down tokens.
-    - On MATCHED fill of an initial order, immediately place a 96c BUY
-      on the opposite outcome token for speed.
+    Supports multiple independent buy pairs, each with its own initial price,
+    reaction price, and order size (configured via POLY_BUY_PAIRS env var).
+
+    Strategy (per pair):
+    - On start, place an initial BUY order on both the Up and Down tokens.
+    - On MATCHED fill of an initial order, immediately place a reaction BUY
+      at that pair's reaction price on the opposite outcome token.
     - If the trade is not MINED or CONFIRMED within CONFIRM_TIMEOUT_SEC,
       cancel the reaction order (the initial fill didn't actually go through).
     - On RETRYING, cancel the reaction order but keep tracking — if CONFIRMED
@@ -80,13 +118,15 @@ class SimpleMarketMaker(StrategyEngine):
             position_tracker=position_tracker,
             orderbook_stores=orderbook_stores,
         )
-        # Track order IDs for the initial resting orders
-        self._up_initial_order_id: str | None = None
-        self._down_initial_order_id: str | None = None
+        self._buy_pairs = BUY_PAIRS
 
-        # Accumulate partial fills per token before placing reaction orders.
-        # Keyed by token_id that was filled (the reaction goes to the *opposite* token).
-        self._pending_fill_size: dict[str, float] = {}
+        # Maps order_id -> BuyPair for every live initial order
+        self._initial_order_to_pair: dict[str, BuyPair] = {}
+        # Maps (pair_index, token_id) -> order_id for end-of-market cancellation
+        self._initial_orders: dict[tuple[int, str], str] = {}
+
+        # Accumulate partial fills per (pair, token) before placing reaction orders.
+        self._pending_fill_size: dict[tuple[int, str], float] = {}
         self._fill_lock = threading.Lock()
 
         # Pending reaction confirmations: reaction_order_id -> _PendingReaction
@@ -126,34 +166,40 @@ class SimpleMarketMaker(StrategyEngine):
             )
         return order_id
 
-    def _place_initial_order(self, token_id: str, side_label: str) -> str | None:
-        """Place a 3c / ORDER_SIZE initial buy order."""
+    def _place_initial_order(self, token_id: str, side_label: str, pair: BuyPair) -> str | None:
+        """Place an initial buy order for the given pair."""
         logger.info(
-            "[%s] Placing initial BUY: %s token=%s price=%.2f size=%.0f",
-            self.market.slug, side_label, token_id[:12],
-            INITIAL_BUY_PRICE, ORDER_SIZE,
+            "[%s] Placing initial BUY: %s pair=%d token=%s price=%.2f size=%.0f",
+            self.market.slug, side_label, pair.index, token_id[:12],
+            pair.initial_price, pair.size,
         )
-        return self._place_and_track(
+        order_id = self._place_and_track(
             token_id=token_id,
             side_label=side_label,
-            price=INITIAL_BUY_PRICE,
-            size=ORDER_SIZE,
+            price=pair.initial_price,
+            size=pair.size,
             order_type=_OT_INITIAL,
         )
+        if order_id:
+            self._initial_order_to_pair[order_id] = pair
+            self._initial_orders[(pair.index, token_id)] = order_id
+        return order_id
 
     # ── lifecycle hooks ────────────────────────────────────────
 
     def on_start(self) -> None:
         logger.info(
-            "[%s] SimpleMarketMaker started: buy_price=%.2f reaction_price=%.2f size=%.0f",
-            self.market.slug, INITIAL_BUY_PRICE, REACTION_BUY_PRICE, ORDER_SIZE,
+            "[%s] SimpleMarketMaker started: %d buy pair(s)",
+            self.market.slug, len(self._buy_pairs),
         )
-        self._up_initial_order_id = self._place_initial_order(
-            self.market.up_token_id, "UP",
-        )
-        self._down_initial_order_id = self._place_initial_order(
-            self.market.down_token_id, "DOWN",
-        )
+        for pair in self._buy_pairs:
+            logger.info(
+                "[%s]   pair %d: initial=%.2f reaction=%.2f size=%.0f",
+                self.market.slug, pair.index,
+                pair.initial_price, pair.reaction_price, pair.size,
+            )
+            self._place_initial_order(self.market.up_token_id, "UP", pair)
+            self._place_initial_order(self.market.down_token_id, "DOWN", pair)
 
     def on_stop(self) -> None:
         logger.info("[%s] SimpleMarketMaker stopped", self.market.slug)
@@ -189,15 +235,13 @@ class SimpleMarketMaker(StrategyEngine):
         # ── Cancel initial orders near market end ──
         remaining = self.market.end_ts - now
         if remaining < CANCEL_BEFORE_END_SEC:
-            for label, order_id in [
-                ("UP", self._up_initial_order_id),
-                ("DOWN", self._down_initial_order_id),
-            ]:
-                if order_id is None or not self.order_manager.has_order(order_id):
+            for (pair_idx, token_id), order_id in list(self._initial_orders.items()):
+                if not self.order_manager.has_order(order_id):
                     continue
+                label = "UP" if token_id == self.market.up_token_id else "DOWN"
                 logger.info(
-                    "[%s] <1 min left (%.0fs) — cancelling unfilled %s initial order %s",
-                    self.market.slug, remaining, label, order_id[:12],
+                    "[%s] <1 min left (%.0fs) — cancelling unfilled %s pair=%d initial order %s",
+                    self.market.slug, remaining, label, pair_idx, order_id[:12],
                 )
                 self.order_placer.cancel_order(order_id)
                 self.order_manager.remove_order(order_id)
@@ -271,6 +315,15 @@ class SimpleMarketMaker(StrategyEngine):
                 )
                 return
 
+        # Look up which buy pair this initial order belongs to
+        pair = self._initial_order_to_pair.get(order_id) if order_id else None
+        if pair is None:
+            logger.warning(
+                "[%s] Initial order %s has no associated pair — ignoring",
+                self.market.slug, (order_id or "?")[:12],
+            )
+            return
+
         # Determine the opposite token
         if token_id == self.market.up_token_id:
             opposite_token = self.market.down_token_id
@@ -287,14 +340,15 @@ class SimpleMarketMaker(StrategyEngine):
 
         # Accumulate fill size — exchange requires minimum order of 5 shares.
         # Lock prevents concurrent partial fills from each firing a reaction.
+        fill_key = (pair.index, token_id)
         trade_ids_for_reaction: set[str] = set()
         with self._fill_lock:
-            accumulated = self._pending_fill_size.get(token_id, 0.0) + size
+            accumulated = self._pending_fill_size.get(fill_key, 0.0) + size
             if accumulated < MIN_ORDER_SIZE:
-                self._pending_fill_size[token_id] = accumulated
+                self._pending_fill_size[fill_key] = accumulated
                 logger.info(
-                    "[%s] Accumulated %.2f shares on %s (need %.0f) — waiting for more fills",
-                    self.market.slug, accumulated, token_id[:12], MIN_ORDER_SIZE,
+                    "[%s] Accumulated %.2f shares on %s pair=%d (need %.0f) — waiting for more fills",
+                    self.market.slug, accumulated, token_id[:12], pair.index, MIN_ORDER_SIZE,
                 )
                 # Still need to track this trade_id for confirmation even though
                 # we haven't placed the reaction yet. We'll associate it when we do.
@@ -302,20 +356,20 @@ class SimpleMarketMaker(StrategyEngine):
 
             # Claim the accumulated size and reset before releasing the lock
             reaction_size = accumulated
-            self._pending_fill_size[token_id] = 0.0
+            self._pending_fill_size[fill_key] = 0.0
             if trade_id:
                 trade_ids_for_reaction.add(trade_id)
 
         # Place reaction order outside the lock (network I/O)
         logger.info(
-            "[%s] Placing reaction BUY: %s token=%s price=%.2f size=%.2f",
-            self.market.slug, opposite_label, opposite_token[:12],
-            REACTION_BUY_PRICE, reaction_size,
+            "[%s] Placing reaction BUY: %s pair=%d token=%s price=%.2f size=%.2f",
+            self.market.slug, opposite_label, pair.index, opposite_token[:12],
+            pair.reaction_price, reaction_size,
         )
         reaction_order_id = self._place_and_track(
             token_id=opposite_token,
             side_label=opposite_label,
-            price=REACTION_BUY_PRICE,
+            price=pair.reaction_price,
             size=reaction_size,
             order_type=_OT_FILL_REACTION,
         )
@@ -329,6 +383,7 @@ class SimpleMarketMaker(StrategyEngine):
                     opposite_token=opposite_token,
                     opposite_label=opposite_label,
                     reaction_size=reaction_size,
+                    reaction_price=pair.reaction_price,
                     trade_ids=trade_ids_for_reaction,
                 )
 
@@ -358,14 +413,14 @@ class SimpleMarketMaker(StrategyEngine):
                         "%s token=%s price=%.2f size=%.2f",
                         self.market.slug, trade_id[:12], status,
                         pr.opposite_label, pr.opposite_token[:12],
-                        REACTION_BUY_PRICE, pr.reaction_size,
+                        pr.reaction_price, pr.reaction_size,
                     )
                     with self._pending_reactions_lock:
                         self._pending_reactions.pop(rid, None)
                     new_order_id = self._place_and_track(
                         token_id=pr.opposite_token,
                         side_label=pr.opposite_label,
-                        price=REACTION_BUY_PRICE,
+                        price=pr.reaction_price,
                         size=pr.reaction_size,
                         order_type=_OT_FILL_REACTION,
                     )

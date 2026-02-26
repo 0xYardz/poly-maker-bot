@@ -149,7 +149,11 @@ class DashboardDataCollector:
             base.update({
                 "type": "simple_mm",
                 "pending_reactions": len(s._pending_reactions),
-                "pending_fill_size": dict(s._pending_fill_size),
+                "pending_fill_size": {
+                    f"pair{k[0]}_{k[1][:12]}": v
+                    for k, v in s._pending_fill_size.items()
+                },
+                "buy_pairs": len(s._buy_pairs),
             })
 
         return base
