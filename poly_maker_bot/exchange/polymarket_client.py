@@ -12,7 +12,7 @@ import requests
 from py_clob_client import OpenOrderParams, TradeParams
 from py_clob_client.client import ClobClient, ApiCreds, OrderArgs, OrderType  # from py-clob-client
 
-from polymarket_apis import PolymarketDataClient, PolymarketGaslessWeb3Client
+from polymarket_apis import PolymarketDataClient, PolymarketGaslessWeb3Client, PolymarketWeb3Client
 
 from poly_maker_bot.config import ExchangeConfig
 from poly_maker_bot.metrics import RollingLatency, RateTracker
@@ -272,6 +272,12 @@ class PolymarketClient:
       private_key=private_key,
       signature_type=2,  # Safe wallet
       builder_creds=builder_creds,
+    )
+    polygon_rpc_url = os.environ.get("POLYGON_RPC_URL", "https://polygon.drpc.org")
+    self._web3_gas_client = PolymarketWeb3Client(
+      private_key=private_key,
+      signature_type=2,  # Safe wallet
+      rpc_url=polygon_rpc_url,
     )
 
   def get_clob_api_creds(self) -> ApiCreds:
@@ -1249,20 +1255,38 @@ class PolymarketClient:
         by_condition[cid][int(pos.get("outcomeIndex", 0))] = float(pos.get("size", 0))
         neg_risk_map[cid] = pos.get("negativeRisk", True)
 
-      for condition_id, outcomes in by_condition.items():
+      for idx, (condition_id, outcomes) in enumerate(by_condition.items()):
         amounts = [outcomes.get(0, 0.0), outcomes.get(1, 0.0)]
         neg_risk = neg_risk_map[condition_id]
+
+        # Avoid 429 rate-limits on the relayer
+        if idx > 0:
+          time.sleep(2)
 
         try:
           logger.info(
             f"[REDEEM] Redeeming condition={condition_id[:12]}... "
             f"amounts={amounts} neg_risk={neg_risk}"
           )
-          receipt = self._web3_client.redeem_position(
-            condition_id=condition_id,
-            amounts=amounts,
-            neg_risk=neg_risk,
-          )
+          try:
+            receipt = self._web3_client.redeem_position(
+              condition_id=condition_id,
+              amounts=amounts,
+              neg_risk=neg_risk,
+            )
+          except Exception as gasless_err:
+            if "429" in str(gasless_err):
+              logger.warning(
+                f"[REDEEM] Gasless 429 for condition={condition_id[:12]}..., "
+                f"falling back to gas client"
+              )
+              receipt = self._web3_gas_client.redeem_position(
+                condition_id=condition_id,
+                amounts=amounts,
+                neg_risk=neg_risk,
+              )
+            else:
+              raise
           if receipt.status == 1:
             redeemed += 1
             logger.info(
