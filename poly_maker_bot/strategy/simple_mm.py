@@ -257,10 +257,12 @@ class SimpleMarketMaker(StrategyEngine):
         # falling through to the reaction logic incorrectly.
         if order_id:
             order_type = self.order_manager.get_order_type(order_id)
-            if order_type and order_type != _OT_INITIAL:
+            if order_type != _OT_INITIAL:
                 logger.info(
-                    "[%s] Reaction fill — position updated, no further action. order=%s",
-                    self.market.slug, order_id[:12],
+                    "[%s] %s fill — position updated, no further action. order=%s",
+                    self.market.slug,
+                    order_type or "unknown",
+                    order_id[:12],
                 )
                 return
 
