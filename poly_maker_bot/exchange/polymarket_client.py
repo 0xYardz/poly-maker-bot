@@ -274,6 +274,7 @@ class PolymarketClient:
       builder_creds=builder_creds,
     )
     polygon_rpc_url = os.environ.get("POLYGON_RPC_URL", "https://polygon.drpc.org")
+    logger.info("Initialized PolymarketClient with RPC URL: %s", polygon_rpc_url)
     self._web3_gas_client = PolymarketWeb3Client(
       private_key=private_key,
       signature_type=2,  # Safe wallet
@@ -1280,11 +1281,17 @@ class PolymarketClient:
                 f"[REDEEM] Gasless 429 for condition={condition_id[:12]}..., "
                 f"falling back to gas client"
               )
-              receipt = self._web3_gas_client.redeem_position(
-                condition_id=condition_id,
-                amounts=amounts,
-                neg_risk=neg_risk,
-              )
+              try:
+                receipt = self._web3_gas_client.redeem_position(
+                  condition_id=condition_id,
+                  amounts=amounts,
+                  neg_risk=neg_risk,
+                )
+              except Exception as gas_err:
+                logger.error(
+                  f"[REDEEM] Gas fallback also failed for condition={condition_id[:12]}...: {gas_err}"
+                )
+                continue
             else:
               raise
           if receipt.status == 1:
