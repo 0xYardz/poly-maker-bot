@@ -85,7 +85,7 @@ class DashboardServer:
         self,
         bot,
         db,
-        host: str = "0.0.0.0",
+        host: str = "127.0.0.1",
         port: int = 8080,
     ):
         from poly_maker_bot.dashboard.data_collector import DashboardDataCollector
