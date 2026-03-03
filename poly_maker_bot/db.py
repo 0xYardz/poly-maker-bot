@@ -313,7 +313,10 @@ class TradeDatabase:
                       COALESCE(SUM(CASE WHEN t.token_id = m.down_token_id THEN t.size ELSE 0 END), 0) as down_shares,
                       COALESCE(SUM(CASE WHEN t.token_id = m.down_token_id THEN t.usdc_value ELSE 0 END), 0) as down_cost,
                       MAX(t.strategy) as strategy,
-                      m.resolved_winner
+                      m.resolved_winner,
+                      m.start_ts,
+                      m.end_ts,
+                      m.question
                FROM trades t
                JOIN markets m ON t.market_slug = m.slug
                WHERE t.status != 'FAILED'
@@ -382,11 +385,30 @@ class TradeDatabase:
         markets_traded = len(pnl_rows)
         estimated_pnl = sum(r["estimated_pnl"] for r in pnl_rows)
 
+        # Win rate: resolved markets where estimated_pnl > 0
+        resolved = [r for r in pnl_rows if r.get("resolved")]
+        wins = sum(1 for r in resolved if r["estimated_pnl"] > 0.0001)
+        losses = sum(1 for r in resolved if r["estimated_pnl"] < -0.0001)
+        resolved_count = len(resolved)
+        win_rate = (wins / resolved_count * 100) if resolved_count > 0 else 0.0
+
+        # Average PnL per resolved market
+        avg_pnl = (
+            sum(r["estimated_pnl"] for r in resolved) / resolved_count
+            if resolved_count > 0
+            else 0.0
+        )
+
         return {
             "total_trades": total_trades,
             "total_volume": total_volume,
             "markets_traded": markets_traded,
             "estimated_pnl": round(estimated_pnl, 6),
+            "win_rate": round(win_rate, 1),
+            "wins": wins,
+            "losses": losses,
+            "resolved_count": resolved_count,
+            "avg_pnl_per_market": round(avg_pnl, 6),
         }
 
     def get_markets_traded(self) -> list[dict]:

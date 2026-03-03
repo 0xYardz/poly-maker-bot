@@ -350,6 +350,58 @@
   .card-header .card-title {
     margin-bottom: 0;
   }
+
+  /* ── Table scroll wrapper ────────────────── */
+  .table-scroll {
+    overflow-x: auto;
+    -webkit-overflow-scrolling: touch;
+  }
+  .table-scroll::-webkit-scrollbar { height: 4px; }
+  .table-scroll::-webkit-scrollbar-track { background: transparent; }
+  .table-scroll::-webkit-scrollbar-thumb { background: var(--border); border-radius: 2px; }
+
+  /* ── Mobile ──────────────────────────────── */
+  @media (max-width: 768px) {
+    body { padding: 12px 10px; }
+
+    header { flex-wrap: wrap; gap: 8px; }
+    .logo h1 { font-size: 16px; }
+
+    .summary-row {
+      grid-template-columns: repeat(2, 1fr);
+      gap: 8px;
+    }
+    .stat-card { padding: 10px 12px; }
+    .stat-value { font-size: 18px; }
+    .stat-sub { font-size: 10px; }
+
+    .grid {
+      grid-template-columns: 1fr;
+    }
+    .full { grid-column: auto; }
+
+    .ob-row { grid-template-columns: 1fr; gap: 8px; }
+    .strategy-grid { grid-template-columns: 1fr; }
+
+    .card { padding: 12px 14px; }
+    .card-header { flex-direction: column; align-items: flex-start; gap: 8px; }
+    .tab-bar { flex-wrap: wrap; }
+
+    .metrics-row { flex-direction: column; gap: 8px; }
+    .metric-group { flex-wrap: wrap; }
+
+    td { font-size: 11px; padding: 6px 8px; }
+    th { font-size: 9px; padding: 0 8px 8px; }
+  }
+
+  @media (max-width: 480px) {
+    .summary-row {
+      grid-template-columns: 1fr;
+    }
+    .stat-value { font-size: 16px; }
+    .market-slug { font-size: 12px; word-break: break-all; }
+    .market-timer { font-size: 14px; }
+  }
 </style>
 </head>
 <body>
@@ -383,13 +435,13 @@
   <!-- Positions -->
   <div class="card full">
     <div class="card-title">Positions</div>
-    <div id="positions-content" class="empty">No positions</div>
+    <div class="table-scroll"><div id="positions-content" class="empty">No positions</div></div>
   </div>
 
   <!-- Open Orders -->
   <div class="card">
     <div class="card-title">Open Orders</div>
-    <div id="orders-content" class="empty">No open orders</div>
+    <div class="table-scroll"><div id="orders-content" class="empty">No open orders</div></div>
   </div>
 
   <!-- Strategy State -->
@@ -404,7 +456,7 @@
       <div class="card-title">PnL by Market</div>
       <div class="tab-bar" id="pnl-tabs"></div>
     </div>
-    <div id="pnl-market-content" class="scroll-y empty">No market data yet</div>
+    <div class="table-scroll"><div id="pnl-market-content" class="scroll-y empty">No market data yet</div></div>
   </div>
 
   <!-- Recent Trades (follows same tab) -->
@@ -413,7 +465,7 @@
       <div class="card-title">Recent Trades</div>
       <div class="tab-bar" id="trades-tabs"></div>
     </div>
-    <div id="trades-content" class="scroll-y empty">No trades yet</div>
+    <div class="table-scroll"><div id="trades-content" class="scroll-y empty">No trades yet</div></div>
   </div>
 
   <!-- Metrics -->
@@ -461,6 +513,30 @@ function tokenLabel(tokenId) {
   if (tokenId === currentMarket.up_token_id) return 'UP';
   if (tokenId === currentMarket.down_token_id) return 'DOWN';
   return truncId(tokenId);
+}
+
+function fmtMarketTime(m) {
+  // Show start time + timespan derived from slug or timestamps
+  if (m.start_ts) {
+    const d = new Date(m.start_ts * 1000);
+    const dateStr = d.toLocaleDateString('en-US', {month:'short', day:'numeric'});
+    const timeStr = d.toLocaleTimeString('en-US', {hour:'2-digit', minute:'2-digit', hour12:false});
+    // Derive timespan from duration
+    let span = '';
+    if (m.start_ts && m.end_ts) {
+      const dur = m.end_ts - m.start_ts;
+      if (dur <= 300) span = '5m';
+      else if (dur <= 900) span = '15m';
+      else span = '1h';
+    }
+    // Extract underlying from slug (e.g. "btc-updown-15m-...")
+    let underlying = '';
+    const slug = m.market_slug || '';
+    const parts = slug.split('-');
+    if (parts.length >= 1) underlying = parts[0].toUpperCase();
+    return `${underlying} ${span} ${dateStr} ${timeStr}`;
+  }
+  return m.market_slug || '?';
 }
 
 // Human-readable labels for strategy names
@@ -590,11 +666,31 @@ function updateSummary(data) {
 
   const tabLabel = activeTab === 'all' ? 'All-Time' : strategyDisplayName(activeTab);
 
+  // Win rate / avg PnL from filtered resolved markets
+  const resolvedFiltered = pnlByMarket.filter(m => m.resolved);
+  const filteredWins = resolvedFiltered.filter(m => (m.estimated_pnl || 0) > 0.0001).length;
+  const filteredLosses = resolvedFiltered.filter(m => (m.estimated_pnl || 0) < -0.0001).length;
+  const filteredResolved = resolvedFiltered.length;
+  const filteredWinRate = filteredResolved > 0 ? (filteredWins / filteredResolved * 100) : 0;
+  const filteredAvgPnl = filteredResolved > 0
+    ? resolvedFiltered.reduce((s, m) => s + (m.estimated_pnl || 0), 0) / filteredResolved
+    : 0;
+
   document.getElementById('summary').innerHTML = `
     <div class="stat-card">
       <div class="stat-label">${tabLabel} PnL</div>
       <div class="stat-value ${pnlClass(filteredPnl)}">${pnlSign(filteredPnl)}${fmt$(filteredPnl,2)}</div>
       <div class="stat-sub">${filteredTrades} trades</div>
+    </div>
+    <div class="stat-card">
+      <div class="stat-label">Win Rate</div>
+      <div class="stat-value ${filteredWinRate >= 50 ? 'positive' : filteredWinRate > 0 ? 'negative' : 'neutral'}">${filteredWinRate.toFixed(1)}%</div>
+      <div class="stat-sub">${filteredWins}W / ${filteredLosses}L (${filteredResolved} resolved)</div>
+    </div>
+    <div class="stat-card">
+      <div class="stat-label">Avg PnL / Market</div>
+      <div class="stat-value ${pnlClass(filteredAvgPnl)}">${pnlSign(filteredAvgPnl)}${fmt$(filteredAvgPnl, 4)}</div>
+      <div class="stat-sub">${filteredResolved} resolved market${filteredResolved!==1?'s':''}</div>
     </div>
     <div class="stat-card">
       <div class="stat-label">Session PnL</div>
@@ -775,7 +871,7 @@ function updatePnlByMarket(pnlByMarket) {
   el.className = 'scroll-y';
 
   let html = '<table><thead><tr>' +
-    '<th>Market</th><th class="text-right">Trades</th>' +
+    '<th>Market</th><th>Slug</th><th class="text-right">Trades</th>' +
     '<th class="text-right">Paired</th>' +
     '<th class="text-right">Paired PnL</th>' +
     '<th class="text-right">Unmatched</th>' +
@@ -794,8 +890,11 @@ function updatePnlByMarket(pnlByMarket) {
         ? ` <span class="${pnlClass(unmatchedPnl)}">${pnlSign(unmatchedPnl)}${fmt$(unmatchedPnl, 2)}</span>`
         : ` <span style="color:var(--text-dim)">(${fmt$(m.unmatched_cost, 2)} at risk)</span>`)
       : '';
+    const marketLabel = fmtMarketTime(m);
+    const resolvedMark = m.resolved ? ' <span style="color:var(--text-dim);font-size:10px">&#10003;</span>' : '';
     html += `<tr>
-      <td>${m.market_slug}${m.resolved ? ' <span style="color:var(--text-dim);font-size:10px">&#10003;</span>' : ''}</td>
+      <td>${marketLabel}${resolvedMark}</td>
+      <td style="color:var(--text-muted);font-size:11px">${m.market_slug}</td>
       <td class="text-right">${m.trade_count}</td>
       <td class="text-right">${(m.paired_shares || 0).toFixed(0)}</td>
       <td class="text-right ${pnlClass(pairedPnl)}">${pnlSign(pairedPnl)}${fmt$(pairedPnl, 4)}</td>
