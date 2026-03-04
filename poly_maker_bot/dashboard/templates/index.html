@@ -397,6 +397,36 @@
     th { font-size: 9px; padding: 0 8px 8px; }
   }
 
+  /* ── Chart tooltip ────────────────────────── */
+  .chart-tooltip {
+    display: none;
+    position: absolute;
+    pointer-events: none;
+    background: var(--surface);
+    border: 1px solid var(--border);
+    border-radius: 6px;
+    padding: 6px 10px;
+    font-family: var(--mono);
+    font-size: 11px;
+    line-height: 1.6;
+    color: var(--text);
+    white-space: nowrap;
+    z-index: 10;
+    box-shadow: 0 4px 12px rgba(0,0,0,0.4);
+  }
+  .chart-tooltip.visible { display: block; }
+  .chart-crosshair {
+    position: absolute;
+    top: 0;
+    width: 1px;
+    background: var(--text-dim);
+    pointer-events: none;
+    display: none;
+    z-index: 5;
+  }
+  .chart-crosshair.visible { display: block; }
+  #pnl-chart { cursor: crosshair; }
+
   /* ── Custom range picker ──────────────────── */
   .custom-range {
     display: none;
@@ -512,6 +542,8 @@
     </div>
     <div id="pnl-chart-container" style="position:relative;width:100%;height:220px">
       <canvas id="pnl-chart"></canvas>
+      <div class="chart-crosshair" id="chart-crosshair"></div>
+      <div class="chart-tooltip" id="chart-tooltip"></div>
     </div>
   </div>
 
@@ -1016,10 +1048,15 @@ function updateStrategy(s) {
 }
 
 // ── Cumulative PnL Chart (pure canvas) ────
+// Store chart state for hover interaction
+let _chartState = null;
+
 function updatePnlChart(pnlByMarket) {
   const canvas = document.getElementById('pnl-chart');
   const container = document.getElementById('pnl-chart-container');
   if (!canvas || !container) return;
+
+  _chartState = null; // reset hover state
 
   const dpr = window.devicePixelRatio || 1;
   const w = container.clientWidth;
@@ -1066,7 +1103,6 @@ function updatePnlChart(pnlByMarket) {
   const pnlValues = points.map(p => p.pnl);
   let pnlMin = Math.min(...pnlValues);
   let pnlMax = Math.max(...pnlValues);
-  // Add 10% padding
   const pnlPad = Math.max((pnlMax - pnlMin) * 0.1, 0.001);
   pnlMin -= pnlPad;
   pnlMax += pnlPad;
@@ -1074,6 +1110,9 @@ function updatePnlChart(pnlByMarket) {
 
   function xPos(ts) { return pad.left + ((ts - tsMin) / tsRange) * cw; }
   function yPos(pnl) { return pad.top + (1 - (pnl - pnlMin) / pnlRange) * ch; }
+
+  // Store for hover
+  _chartState = { points, pad, w, h, tsMin, tsMax, tsRange, pnlMin, pnlMax, pnlRange, xPos, yPos };
 
   const styles = getComputedStyle(document.documentElement);
   const green = styles.getPropertyValue('--green').trim();
@@ -1094,7 +1133,6 @@ function updatePnlChart(pnlByMarket) {
     ctx.lineTo(w - pad.right, y);
     ctx.stroke();
 
-    // Y-axis labels
     ctx.fillStyle = textMuted;
     ctx.font = '10px ' + styles.getPropertyValue('--mono').trim();
     ctx.textAlign = 'right';
@@ -1102,7 +1140,7 @@ function updatePnlChart(pnlByMarket) {
     ctx.fillText('$' + val.toFixed(2), pad.left - 6, y);
   }
 
-  // Zero line (if in range)
+  // Zero line
   if (pnlMin < 0 && pnlMax > 0) {
     const y0 = yPos(0);
     ctx.strokeStyle = textDim;
@@ -1136,9 +1174,7 @@ function updatePnlChart(pnlByMarket) {
   // Area fill
   ctx.beginPath();
   ctx.moveTo(xPos(points[0].ts), yPos(0));
-  for (const p of points) {
-    ctx.lineTo(xPos(p.ts), yPos(p.pnl));
-  }
+  for (const p of points) ctx.lineTo(xPos(p.ts), yPos(p.pnl));
   ctx.lineTo(xPos(points[points.length - 1].ts), yPos(0));
   ctx.closePath();
   const grad = ctx.createLinearGradient(0, pad.top, 0, h - pad.bottom);
@@ -1155,22 +1191,116 @@ function updatePnlChart(pnlByMarket) {
   for (let i = 0; i < points.length; i++) {
     const x = xPos(points[i].ts);
     const y = yPos(points[i].pnl);
-    if (i === 0) ctx.moveTo(x, y);
-    else ctx.lineTo(x, y);
+    if (i === 0) ctx.moveTo(x, y); else ctx.lineTo(x, y);
   }
   ctx.stroke();
 
-  // Data point dots
+  // Data point dots — store pixel positions for hit detection
   for (let i = 1; i < points.length; i++) {
     const p = points[i];
-    const x = xPos(p.ts);
-    const y = yPos(p.pnl);
+    p._px = xPos(p.ts);
+    p._py = yPos(p.pnl);
     ctx.beginPath();
-    ctx.arc(x, y, 2.5, 0, Math.PI * 2);
+    ctx.arc(p._px, p._py, 2.5, 0, Math.PI * 2);
     ctx.fillStyle = lineColor;
     ctx.fill();
   }
+  // Store pixel pos for the origin point too
+  points[0]._px = xPos(points[0].ts);
+  points[0]._py = yPos(points[0].pnl);
 }
+
+// ── Chart hover interaction ───────────────
+(function() {
+  const container = document.getElementById('pnl-chart-container');
+  const tooltip = document.getElementById('chart-tooltip');
+  const crosshair = document.getElementById('chart-crosshair');
+  if (!container || !tooltip || !crosshair) return;
+
+  function handleMove(clientX, clientY) {
+    if (!_chartState) { hideTooltip(); return; }
+    const rect = container.getBoundingClientRect();
+    const mx = clientX - rect.left;
+    const my = clientY - rect.top;
+    const {points, pad, w, h} = _chartState;
+
+    // Outside chart area?
+    if (mx < pad.left || mx > w - pad.right || my < 0 || my > h) {
+      hideTooltip();
+      return;
+    }
+
+    // Find nearest point by x pixel distance
+    let nearest = null;
+    let nearestDist = Infinity;
+    for (let i = 0; i < points.length; i++) {
+      const p = points[i];
+      if (p._px === undefined) continue;
+      const dist = Math.abs(p._px - mx);
+      if (dist < nearestDist) {
+        nearestDist = dist;
+        nearest = p;
+      }
+    }
+
+    if (!nearest || nearestDist > 40) { hideTooltip(); return; }
+
+    // Crosshair
+    crosshair.style.left = nearest._px + 'px';
+    crosshair.style.height = (h - pad.bottom - pad.top) + 'px';
+    crosshair.style.top = pad.top + 'px';
+    crosshair.classList.add('visible');
+
+    // Tooltip content
+    const d = new Date(nearest.ts * 1000);
+    const timeStr = d.toLocaleDateString('en-US', {month:'short', day:'numeric'}) + ' ' +
+      d.toLocaleTimeString('en-US', {hour:'2-digit', minute:'2-digit', hour12:false});
+    const pnlStr = (nearest.pnl >= 0 ? '+' : '') + '$' + nearest.pnl.toFixed(4);
+    const pnlColor = nearest.pnl > 0.0001 ? 'var(--green)' : nearest.pnl < -0.0001 ? 'var(--red)' : 'var(--text)';
+
+    let marketInfo = '';
+    if (nearest.market) {
+      const m = nearest.market;
+      const mPnl = m.estimated_pnl || 0;
+      const mSign = mPnl >= 0 ? '+' : '';
+      const mColor = mPnl > 0.0001 ? 'var(--green)' : mPnl < -0.0001 ? 'var(--red)' : 'var(--text)';
+      marketInfo = `<br><span style="color:var(--text-muted)">${fmtMarketTime(m)}</span><br>` +
+        `Market: <span style="color:${mColor}">${mSign}$${mPnl.toFixed(4)}</span>`;
+    }
+
+    tooltip.innerHTML = `<span style="color:var(--text-muted)">${timeStr}</span><br>` +
+      `PnL: <span style="color:${pnlColor}">${pnlStr}</span>${marketInfo}`;
+    tooltip.classList.add('visible');
+
+    // Position tooltip — avoid overflow
+    let tx = nearest._px + 12;
+    let ty = nearest._py - 10;
+    const tw = tooltip.offsetWidth;
+    const th2 = tooltip.offsetHeight;
+    if (tx + tw > w - 4) tx = nearest._px - tw - 12;
+    if (ty < 4) ty = 4;
+    if (ty + th2 > h - 4) ty = h - th2 - 4;
+    tooltip.style.left = tx + 'px';
+    tooltip.style.top = ty + 'px';
+  }
+
+  function hideTooltip() {
+    tooltip.classList.remove('visible');
+    crosshair.classList.remove('visible');
+  }
+
+  container.addEventListener('mousemove', e => handleMove(e.clientX, e.clientY));
+  container.addEventListener('mouseleave', hideTooltip);
+
+  // Touch support
+  container.addEventListener('touchmove', e => {
+    if (e.touches.length === 1) {
+      e.preventDefault();
+      handleMove(e.touches[0].clientX, e.touches[0].clientY);
+    }
+  }, {passive: false});
+  container.addEventListener('touchend', hideTooltip);
+})();
 
 // Redraw chart on window resize
 let _resizeTimer;
