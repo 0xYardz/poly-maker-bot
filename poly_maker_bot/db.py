@@ -316,7 +316,13 @@ class TradeDatabase:
                       m.resolved_winner,
                       m.start_ts,
                       m.end_ts,
-                      m.question
+                      m.question,
+                      -- Seconds before market close of the first initial_buy
+                      (SELECT MAX(0, m.end_ts - MIN(t2.created_at))
+                       FROM trades t2
+                       WHERE t2.market_slug = t.market_slug
+                         AND t2.order_type = 'initial_buy'
+                         AND t2.status != 'FAILED') as entry_secs_before_close
                FROM trades t
                JOIN markets m ON t.market_slug = m.slug
                WHERE t.status != 'FAILED'

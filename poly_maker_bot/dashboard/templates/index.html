@@ -360,6 +360,40 @@
   .table-scroll::-webkit-scrollbar-track { background: transparent; }
   .table-scroll::-webkit-scrollbar-thumb { background: var(--border); border-radius: 2px; }
 
+  /* ── Expandable market rows ────────────────── */
+  tr.market-row { cursor: pointer; transition: background 0.1s; }
+  tr.market-row:hover { background: var(--surface2); }
+  tr.market-row.expanded { background: var(--surface2); }
+  tr.expand-row td {
+    background: var(--bg);
+    padding: 8px 12px 12px;
+    border-bottom: 1px solid var(--border);
+  }
+  tr.expand-row table {
+    width: 100%;
+    font-size: 11px;
+    border-collapse: collapse;
+  }
+  tr.expand-row table th {
+    color: var(--text-dim);
+    font-weight: 500;
+    font-size: 10px;
+    text-transform: uppercase;
+    letter-spacing: 0.5px;
+    padding: 4px 8px;
+    border-bottom: 1px solid var(--border);
+  }
+  tr.expand-row table td {
+    padding: 4px 8px;
+    background: transparent;
+    border-bottom: 1px solid rgba(37,45,56,0.5);
+  }
+  .expand-label {
+    font-size: 10px;
+    color: var(--text-dim);
+    margin-bottom: 6px;
+  }
+
   /* ── Mobile ──────────────────────────────── */
   @media (max-width: 768px) {
     body { padding: 12px 10px; }
@@ -581,6 +615,8 @@ let activeTimeRange = 'all'; // 'all', '1h', '6h', '24h', '3d', '7d', 'custom'
 let customRangeFrom = 0; // unix seconds
 let customRangeTo = 0;   // unix seconds
 let _lastRealtimeData = null;
+let lateEntryThreshold = 20; // seconds — configurable via input
+const expandedSlugs = new Set();
 
 const TIME_RANGES = [
   {key: '1h',  label: '1H',  sec: 3600},
@@ -879,6 +915,20 @@ function updateSummary(data) {
       <div class="stat-value ${pnlClass(filteredAvgPnl)}">${pnlSign(filteredAvgPnl)}${fmt$(filteredAvgPnl, 4)}</div>
       <div class="stat-sub">${filteredResolved} resolved market${filteredResolved!==1?'s':''}</div>
     </div>
+    ${(() => {
+      const late = resolvedFiltered.filter(m => m.entry_secs_before_close != null && m.entry_secs_before_close <= lateEntryThreshold);
+      if (late.length === 0) return '';
+      const lw = late.filter(m => (m.estimated_pnl||0) > 0.0001).length;
+      const ll = late.filter(m => (m.estimated_pnl||0) < -0.0001).length;
+      const lt = lw + ll;
+      const lwr = lt > 0 ? (lw / lt * 100) : 0;
+      const lp = late.reduce((s, m) => s + (m.estimated_pnl||0), 0);
+      return `<div class="stat-card">
+        <div class="stat-label">Late Entry &le;<select id="late-threshold" style="background:var(--surface2);border:1px solid var(--border);color:var(--text);border-radius:4px;padding:1px 4px;font-size:11px;font-family:var(--mono)" onclick="event.stopPropagation()" onchange="lateEntryThreshold=+this.value;if(_lastRealtimeData)updateSummary(_lastRealtimeData)">${[5,10,15,20,30,40,60].map(v=>`<option value="${v}"${v===lateEntryThreshold?' selected':''}>${v}s</option>`).join('')}</select></div>
+        <div class="stat-value ${lwr >= 50 ? 'positive' : lwr > 0 ? 'negative' : 'neutral'}">${lwr.toFixed(1)}%</div>
+        <div class="stat-sub">${lw}W / ${ll}L &middot; PnL ${pnlSign(lp)}${fmt$(lp, 4)}</div>
+      </div>`;
+    })()}
     <div class="stat-card">
       <div class="stat-label">Session PnL</div>
       <div class="stat-value ${pnlClass(sessionPnl)}">${pnlSign(sessionPnl)}${fmt$(sessionPnl,4)}</div>
@@ -1311,6 +1361,40 @@ window.addEventListener('resize', () => {
   }, 150);
 });
 
+function toggleSlugExpand(slug) {
+  if (expandedSlugs.has(slug)) {
+    expandedSlugs.delete(slug);
+  } else {
+    expandedSlugs.add(slug);
+  }
+  if (historicalData?.pnl_by_market) updatePnlByMarket(historicalData.pnl_by_market);
+}
+
+function buildTradesForSlug(slug) {
+  const trades = (historicalData?.recent_trades || []).filter(t => t.market_slug === slug);
+  if (trades.length === 0) return '<div class="expand-label">No trades recorded for this market</div>';
+  let h = `<div class="expand-label">${trades.length} trade${trades.length !== 1 ? 's' : ''}</div>`;
+  h += '<table><thead><tr><th>Time</th><th>Outcome</th><th>Side</th><th>Size</th><th>Price</th><th class="text-right">USDC</th><th>Type</th><th>Tx</th></tr></thead><tbody>';
+  for (const t of trades) {
+    const typeTag = (t.order_type || '').includes('reaction') ? 'reaction' : 'initial';
+    const txLink = t.transaction_hash
+      ? `<a href="https://polygonscan.com/tx/${t.transaction_hash}" target="_blank" rel="noopener" style="color:var(--blue);text-decoration:none">${t.transaction_hash.slice(0,6)}...${t.transaction_hash.slice(-4)}</a>`
+      : '<span style="color:var(--text-dim)">pending</span>';
+    h += `<tr>
+      <td>${fmtDate(t.created_at)}</td>
+      <td>${t.outcome || '-'}</td>
+      <td><span class="tag ${(t.side||'').toLowerCase()}">${t.side}</span></td>
+      <td>${Number(t.size).toFixed(1)}</td>
+      <td>${fmt$(t.price)}</td>
+      <td class="text-right">${fmt$(t.usdc_value, 2)}</td>
+      <td><span class="tag ${typeTag}">${typeTag}</span></td>
+      <td>${txLink}</td>
+    </tr>`;
+  }
+  h += '</tbody></table>';
+  return h;
+}
+
 function updatePnlByMarket(pnlByMarket) {
   const el = document.getElementById('pnl-market-content');
   const filtered = (pnlByMarket || []).filter(m => matchesFilters(m));
@@ -1343,8 +1427,10 @@ function updatePnlByMarket(pnlByMarket) {
       : '';
     const marketLabel = fmtMarketTime(m);
     const resolvedMark = m.resolved ? ' <span style="color:var(--text-dim);font-size:10px">&#10003;</span>' : '';
-    html += `<tr>
-      <td>${marketLabel}${resolvedMark}</td>
+    const isExpanded = expandedSlugs.has(m.market_slug);
+    const expandIcon = isExpanded ? '&#9660;' : '&#9654;';
+    html += `<tr class="market-row${isExpanded ? ' expanded' : ''}" onclick="toggleSlugExpand('${m.market_slug.replace(/'/g, "\\'")}')">
+      <td><span style="color:var(--text-dim);font-size:9px;margin-right:4px">${expandIcon}</span>${marketLabel}${resolvedMark}</td>
       <td style="color:var(--text-muted);font-size:11px">${m.market_slug}</td>
       <td class="text-right">${m.trade_count}</td>
       <td class="text-right">${(m.paired_shares || 0).toFixed(0)}</td>
@@ -1352,6 +1438,9 @@ function updatePnlByMarket(pnlByMarket) {
       <td class="text-right">${unmatchedLabel}${unmatchedDetail}</td>
       <td class="text-right ${pnlClass(totalPnl)}">${pnlSign(totalPnl)}${fmt$(totalPnl, 4)}</td>
     </tr>`;
+    if (isExpanded) {
+      html += `<tr class="expand-row"><td colspan="7">${buildTradesForSlug(m.market_slug)}</td></tr>`;
+    }
   }
   html += '</tbody></table>';
   el.innerHTML = html;
