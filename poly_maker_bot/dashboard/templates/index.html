@@ -390,8 +390,53 @@
     .metrics-row { flex-direction: column; gap: 8px; }
     .metric-group { flex-wrap: wrap; }
 
+    .custom-range { flex-wrap: wrap; }
+    .custom-range input[type="datetime-local"] { font-size: 10px; padding: 3px 6px; }
+
     td { font-size: 11px; padding: 6px 8px; }
     th { font-size: 9px; padding: 0 8px 8px; }
+  }
+
+  /* ── Custom range picker ──────────────────── */
+  .custom-range {
+    display: none;
+    align-items: center;
+    gap: 6px;
+    font-size: 11px;
+    color: var(--text-muted);
+  }
+  .custom-range.open { display: flex; }
+  .custom-range input[type="datetime-local"] {
+    background: var(--surface2);
+    border: 1px solid var(--border);
+    border-radius: 6px;
+    color: var(--text);
+    font-family: var(--mono);
+    font-size: 11px;
+    padding: 4px 8px;
+    outline: none;
+  }
+  .custom-range input[type="datetime-local"]:focus {
+    border-color: var(--blue);
+  }
+  /* Fix the calendar icon color in dark mode */
+  .custom-range input[type="datetime-local"]::-webkit-calendar-picker-indicator {
+    filter: invert(0.7);
+    cursor: pointer;
+  }
+  .custom-range .btn-apply {
+    background: var(--blue-dim);
+    color: var(--blue);
+    border: 1px solid rgba(91,160,245,0.25);
+    border-radius: 6px;
+    font-size: 11px;
+    font-weight: 600;
+    padding: 4px 10px;
+    cursor: pointer;
+    font-family: var(--sans);
+  }
+  .custom-range .btn-apply:hover {
+    background: rgba(91,160,245,0.2);
   }
 
   @media (max-width: 480px) {
@@ -450,6 +495,26 @@
     <div id="strategy-content" class="empty">No active strategy</div>
   </div>
 
+  <!-- Cumulative PnL Chart -->
+  <div class="card full">
+    <div class="card-header">
+      <div class="card-title">Cumulative PnL</div>
+      <div style="display:flex;gap:8px;align-items:center;flex-wrap:wrap">
+        <div class="tab-bar" id="time-range-tabs"></div>
+        <div class="custom-range" id="custom-range">
+          <input type="datetime-local" id="range-from" title="From">
+          <span>to</span>
+          <input type="datetime-local" id="range-to" title="To">
+          <button class="btn-apply" onclick="applyCustomRange()">Apply</button>
+        </div>
+        <div class="tab-bar" id="chart-tabs"></div>
+      </div>
+    </div>
+    <div id="pnl-chart-container" style="position:relative;width:100%;height:220px">
+      <canvas id="pnl-chart"></canvas>
+    </div>
+  </div>
+
   <!-- Strategy/Timespan Tabs + PnL by Market -->
   <div class="card full">
     <div class="card-header">
@@ -480,7 +545,20 @@
 let currentMarket = null;
 let historicalData = {};
 let activeTab = 'all';  // 'all' or strategy name like 'simple_mm', 'volatile_mm'
+let activeTimeRange = 'all'; // 'all', '1h', '6h', '24h', '3d', '7d', 'custom'
+let customRangeFrom = 0; // unix seconds
+let customRangeTo = 0;   // unix seconds
 let _lastRealtimeData = null;
+
+const TIME_RANGES = [
+  {key: '1h',  label: '1H',  sec: 3600},
+  {key: '6h',  label: '6H',  sec: 6 * 3600},
+  {key: '24h', label: '24H', sec: 24 * 3600},
+  {key: '3d',  label: '3D',  sec: 3 * 86400},
+  {key: '7d',  label: '7D',  sec: 7 * 86400},
+  {key: 'all', label: 'All', sec: 0},
+  {key: 'custom', label: 'Custom', sec: -1},
+];
 
 // ── Helpers ────────────────────────────────
 function pnlClass(v) { return v > 0.0001 ? 'positive' : v < -0.0001 ? 'negative' : 'neutral'; }
@@ -553,11 +631,74 @@ function matchesTab(item) {
   return (item.strategy || null) === activeTab;
 }
 
+function matchesTimeRange(item) {
+  if (activeTimeRange === 'all') return true;
+  const ts = item.end_ts || item.created_at || 0;
+  if (activeTimeRange === 'custom') {
+    if (customRangeFrom && ts < customRangeFrom) return false;
+    if (customRangeTo && ts > customRangeTo) return false;
+    return true;
+  }
+  const range = TIME_RANGES.find(r => r.key === activeTimeRange);
+  if (!range) return true;
+  return ts >= (Date.now() / 1000 - range.sec);
+}
+
+function matchesFilters(item) {
+  return matchesTab(item) && matchesTimeRange(item);
+}
+
 function setTab(tab) {
   activeTab = tab;
-  document.querySelectorAll('.tab-bar .tab').forEach(el => {
+  document.querySelectorAll('#pnl-tabs .tab, #trades-tabs .tab, #chart-tabs .tab').forEach(el => {
     el.classList.toggle('active', el.dataset.tab === tab);
   });
+  updateHistorical(historicalData);
+  if (_lastRealtimeData) updateSummary(_lastRealtimeData);
+}
+
+function setTimeRange(range) {
+  activeTimeRange = range;
+  document.querySelectorAll('#time-range-tabs .tab').forEach(el => {
+    el.classList.toggle('active', el.dataset.tab === range);
+  });
+  // Show/hide custom range picker
+  const picker = document.getElementById('custom-range');
+  if (picker) {
+    picker.classList.toggle('open', range === 'custom');
+    if (range === 'custom') {
+      // Pre-fill with sensible defaults if empty
+      const fromEl = document.getElementById('range-from');
+      const toEl = document.getElementById('range-to');
+      if (!fromEl.value) {
+        const yesterday = new Date(Date.now() - 86400000);
+        fromEl.value = toLocalISOString(yesterday);
+      }
+      if (!toEl.value) {
+        toEl.value = toLocalISOString(new Date());
+      }
+      return; // Don't refresh yet, wait for Apply
+    }
+  }
+  customRangeFrom = 0;
+  customRangeTo = 0;
+  updateHistorical(historicalData);
+  if (_lastRealtimeData) updateSummary(_lastRealtimeData);
+}
+
+function toLocalISOString(d) {
+  // Format as YYYY-MM-DDTHH:MM for datetime-local input
+  const pad = n => String(n).padStart(2, '0');
+  return d.getFullYear() + '-' + pad(d.getMonth()+1) + '-' + pad(d.getDate())
+    + 'T' + pad(d.getHours()) + ':' + pad(d.getMinutes());
+}
+
+function applyCustomRange() {
+  const fromVal = document.getElementById('range-from').value;
+  const toVal = document.getElementById('range-to').value;
+  customRangeFrom = fromVal ? new Date(fromVal).getTime() / 1000 : 0;
+  customRangeTo = toVal ? new Date(toVal).getTime() / 1000 : 0;
+  activeTimeRange = 'custom';
   updateHistorical(historicalData);
   if (_lastRealtimeData) updateSummary(_lastRealtimeData);
 }
@@ -574,10 +715,18 @@ function renderTabs() {
     if (t.strategy) strategies.add(t.strategy);
   }
 
-  // Only show tabs if there's more than one strategy (or at least one)
+  // Time range tabs (always rendered)
+  let trHtml = '';
+  for (const r of TIME_RANGES) {
+    trHtml += `<div class="tab ${activeTimeRange === r.key ? 'active' : ''}" data-tab="${r.key}" onclick="setTimeRange('${r.key}')">${r.label}</div>`;
+  }
+  document.getElementById('time-range-tabs').innerHTML = trHtml;
+
+  // Only show strategy tabs if there's more than one strategy (or at least one)
   if (strategies.size === 0) {
     document.getElementById('pnl-tabs').innerHTML = '';
     document.getElementById('trades-tabs').innerHTML = '';
+    document.getElementById('chart-tabs').innerHTML = '';
     return;
   }
 
@@ -589,6 +738,7 @@ function renderTabs() {
 
   document.getElementById('pnl-tabs').innerHTML = tabHtml;
   document.getElementById('trades-tabs').innerHTML = tabHtml;
+  document.getElementById('chart-tabs').innerHTML = tabHtml;
 }
 
 // ── SSE Connection ─────────────────────────
@@ -643,6 +793,7 @@ function updateRealtime(data) {
 function updateHistorical(hist) {
   if (!hist) return;
   renderTabs();
+  updatePnlChart(hist.pnl_by_market);
   updatePnlByMarket(hist.pnl_by_market);
   updateTrades(hist.recent_trades);
 }
@@ -659,12 +810,16 @@ function updateSummary(data) {
   const posCount = Object.keys(data.positions || {}).length;
 
   // Compute filtered stats from historical data
-  const pnlByMarket = (historicalData?.pnl_by_market || []).filter(m => matchesTab(m));
+  const pnlByMarket = (historicalData?.pnl_by_market || []).filter(m => matchesFilters(m));
   const filteredPnl = pnlByMarket.reduce((sum, m) => sum + (m.estimated_pnl || 0), 0);
   const filteredTrades = pnlByMarket.reduce((sum, m) => sum + (m.trade_count || 0), 0);
   const filteredMarkets = pnlByMarket.length;
 
-  const tabLabel = activeTab === 'all' ? 'All-Time' : strategyDisplayName(activeTab);
+  const stratLabel = activeTab === 'all' ? '' : ' ' + strategyDisplayName(activeTab);
+  const timeLabel = activeTimeRange === 'all' ? 'All-Time'
+    : activeTimeRange === 'custom' ? 'Custom'
+    : activeTimeRange.toUpperCase();
+  const tabLabel = timeLabel + stratLabel;
 
   // Win rate / avg PnL from filtered resolved markets
   const resolvedFiltered = pnlByMarket.filter(m => m.resolved);
@@ -705,7 +860,7 @@ function updateSummary(data) {
     <div class="stat-card">
       <div class="stat-label">${tabLabel} Markets</div>
       <div class="stat-value neutral">${filteredMarkets}</div>
-      <div class="stat-sub">${activeTab === 'all' ? 'all time' : strategyDisplayName(activeTab)}</div>
+      <div class="stat-sub">${tabLabel.toLowerCase()}</div>
     </div>
   `;
 }
@@ -860,9 +1015,175 @@ function updateStrategy(s) {
   `;
 }
 
+// ── Cumulative PnL Chart (pure canvas) ────
+function updatePnlChart(pnlByMarket) {
+  const canvas = document.getElementById('pnl-chart');
+  const container = document.getElementById('pnl-chart-container');
+  if (!canvas || !container) return;
+
+  const dpr = window.devicePixelRatio || 1;
+  const w = container.clientWidth;
+  const h = container.clientHeight;
+  canvas.width = w * dpr;
+  canvas.height = h * dpr;
+  canvas.style.width = w + 'px';
+  canvas.style.height = h + 'px';
+
+  const ctx = canvas.getContext('2d');
+  ctx.scale(dpr, dpr);
+  ctx.clearRect(0, 0, w, h);
+
+  // Build sorted cumulative series from resolved markets
+  const filtered = (pnlByMarket || []).filter(m => matchesFilters(m) && m.end_ts);
+  if (filtered.length < 2) {
+    ctx.fillStyle = getComputedStyle(document.documentElement).getPropertyValue('--text-dim');
+    ctx.font = '13px ' + getComputedStyle(document.documentElement).getPropertyValue('--sans');
+    ctx.textAlign = 'center';
+    ctx.fillText('Not enough data to chart', w / 2, h / 2);
+    return;
+  }
+
+  // Sort by end_ts ascending
+  const sorted = [...filtered].sort((a, b) => a.end_ts - b.end_ts);
+
+  // Build cumulative points: start at 0, then accumulate each market's PnL
+  const points = [{ts: sorted[0].end_ts - 1, pnl: 0}];
+  let cumPnl = 0;
+  for (const m of sorted) {
+    cumPnl += m.estimated_pnl || 0;
+    points.push({ts: m.end_ts, pnl: cumPnl, market: m});
+  }
+
+  // Chart dimensions with padding
+  const pad = {top: 20, right: 16, bottom: 36, left: 56};
+  const cw = w - pad.left - pad.right;
+  const ch = h - pad.top - pad.bottom;
+
+  const tsMin = points[0].ts;
+  const tsMax = points[points.length - 1].ts;
+  const tsRange = tsMax - tsMin || 1;
+
+  const pnlValues = points.map(p => p.pnl);
+  let pnlMin = Math.min(...pnlValues);
+  let pnlMax = Math.max(...pnlValues);
+  // Add 10% padding
+  const pnlPad = Math.max((pnlMax - pnlMin) * 0.1, 0.001);
+  pnlMin -= pnlPad;
+  pnlMax += pnlPad;
+  const pnlRange = pnlMax - pnlMin || 1;
+
+  function xPos(ts) { return pad.left + ((ts - tsMin) / tsRange) * cw; }
+  function yPos(pnl) { return pad.top + (1 - (pnl - pnlMin) / pnlRange) * ch; }
+
+  const styles = getComputedStyle(document.documentElement);
+  const green = styles.getPropertyValue('--green').trim();
+  const red = styles.getPropertyValue('--red').trim();
+  const border = styles.getPropertyValue('--border').trim();
+  const textMuted = styles.getPropertyValue('--text-muted').trim();
+  const textDim = styles.getPropertyValue('--text-dim').trim();
+
+  // Grid lines
+  ctx.strokeStyle = border;
+  ctx.lineWidth = 0.5;
+  const yTicks = 5;
+  for (let i = 0; i <= yTicks; i++) {
+    const val = pnlMin + (pnlRange * i / yTicks);
+    const y = yPos(val);
+    ctx.beginPath();
+    ctx.moveTo(pad.left, y);
+    ctx.lineTo(w - pad.right, y);
+    ctx.stroke();
+
+    // Y-axis labels
+    ctx.fillStyle = textMuted;
+    ctx.font = '10px ' + styles.getPropertyValue('--mono').trim();
+    ctx.textAlign = 'right';
+    ctx.textBaseline = 'middle';
+    ctx.fillText('$' + val.toFixed(2), pad.left - 6, y);
+  }
+
+  // Zero line (if in range)
+  if (pnlMin < 0 && pnlMax > 0) {
+    const y0 = yPos(0);
+    ctx.strokeStyle = textDim;
+    ctx.lineWidth = 1;
+    ctx.setLineDash([4, 4]);
+    ctx.beginPath();
+    ctx.moveTo(pad.left, y0);
+    ctx.lineTo(w - pad.right, y0);
+    ctx.stroke();
+    ctx.setLineDash([]);
+  }
+
+  // X-axis time labels
+  const xTicks = Math.min(6, points.length);
+  ctx.fillStyle = textMuted;
+  ctx.font = '10px ' + styles.getPropertyValue('--mono').trim();
+  ctx.textAlign = 'center';
+  ctx.textBaseline = 'top';
+  for (let i = 0; i < xTicks; i++) {
+    const ts = tsMin + (tsRange * i / (xTicks - 1));
+    const d = new Date(ts * 1000);
+    const label = d.toLocaleDateString('en-US', {month:'short', day:'numeric'}) + ' ' +
+      d.toLocaleTimeString('en-US', {hour:'2-digit', minute:'2-digit', hour12:false});
+    ctx.fillText(label, xPos(ts), h - pad.bottom + 8);
+  }
+
+  // Draw the line
+  const finalPnl = points[points.length - 1].pnl;
+  const lineColor = finalPnl >= 0 ? green : red;
+
+  // Area fill
+  ctx.beginPath();
+  ctx.moveTo(xPos(points[0].ts), yPos(0));
+  for (const p of points) {
+    ctx.lineTo(xPos(p.ts), yPos(p.pnl));
+  }
+  ctx.lineTo(xPos(points[points.length - 1].ts), yPos(0));
+  ctx.closePath();
+  const grad = ctx.createLinearGradient(0, pad.top, 0, h - pad.bottom);
+  grad.addColorStop(0, (finalPnl >= 0 ? 'rgba(0,227,150,0.15)' : 'rgba(255,97,120,0.15)'));
+  grad.addColorStop(1, 'rgba(0,0,0,0)');
+  ctx.fillStyle = grad;
+  ctx.fill();
+
+  // Line stroke
+  ctx.beginPath();
+  ctx.strokeStyle = lineColor;
+  ctx.lineWidth = 2;
+  ctx.lineJoin = 'round';
+  for (let i = 0; i < points.length; i++) {
+    const x = xPos(points[i].ts);
+    const y = yPos(points[i].pnl);
+    if (i === 0) ctx.moveTo(x, y);
+    else ctx.lineTo(x, y);
+  }
+  ctx.stroke();
+
+  // Data point dots
+  for (let i = 1; i < points.length; i++) {
+    const p = points[i];
+    const x = xPos(p.ts);
+    const y = yPos(p.pnl);
+    ctx.beginPath();
+    ctx.arc(x, y, 2.5, 0, Math.PI * 2);
+    ctx.fillStyle = lineColor;
+    ctx.fill();
+  }
+}
+
+// Redraw chart on window resize
+let _resizeTimer;
+window.addEventListener('resize', () => {
+  clearTimeout(_resizeTimer);
+  _resizeTimer = setTimeout(() => {
+    if (historicalData?.pnl_by_market) updatePnlChart(historicalData.pnl_by_market);
+  }, 150);
+});
+
 function updatePnlByMarket(pnlByMarket) {
   const el = document.getElementById('pnl-market-content');
-  const filtered = (pnlByMarket || []).filter(m => matchesTab(m));
+  const filtered = (pnlByMarket || []).filter(m => matchesFilters(m));
   if (filtered.length === 0) {
     el.className = 'scroll-y empty';
     el.textContent = 'No market data yet';
@@ -908,7 +1229,7 @@ function updatePnlByMarket(pnlByMarket) {
 
 function updateTrades(trades) {
   const el = document.getElementById('trades-content');
-  const filtered = (trades || []).filter(t => matchesTab(t));
+  const filtered = (trades || []).filter(t => matchesFilters(t));
   if (filtered.length === 0) {
     el.className = 'scroll-y empty';
     el.textContent = 'No trades yet';
