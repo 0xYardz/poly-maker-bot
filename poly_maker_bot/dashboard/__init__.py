@@ -30,6 +30,8 @@ class _Handler(BaseHTTPRequestHandler):
             self._serve_json()
         elif path == "/api/stream":
             self._serve_sse()
+        elif path.startswith("/api/trades/"):
+            self._serve_trades_for_market(path[len("/api/trades/"):])
         else:
             self.send_error(404)
 
@@ -53,6 +55,17 @@ class _Handler(BaseHTTPRequestHandler):
     def _serve_json(self):
         data = self.collector.collect_full_snapshot()
         body = json.dumps(data).encode()
+        self.send_response(200)
+        self.send_header("Content-Type", "application/json")
+        self.send_header("Access-Control-Allow-Origin", "*")
+        self.end_headers()
+        self.wfile.write(body)
+
+    def _serve_trades_for_market(self, slug: str):
+        from urllib.parse import unquote
+        slug = unquote(slug)
+        trades = self.collector.get_trades_for_market(slug)
+        body = json.dumps(trades).encode()
         self.send_response(200)
         self.send_header("Content-Type", "application/json")
         self.send_header("Access-Control-Allow-Origin", "*")

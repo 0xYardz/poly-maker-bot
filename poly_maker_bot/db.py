@@ -294,6 +294,19 @@ class TradeDatabase:
         cols = [d[0] for d in cur.description]
         return [dict(zip(cols, row)) for row in cur.fetchall()]
 
+    def get_trades_for_market(self, market_slug: str) -> list[dict]:
+        """Return all trades for a specific market slug."""
+        cur = self._conn.execute(
+            """SELECT trade_id, order_id, token_id, market_slug,
+                      side, size, price, usdc_value, outcome,
+                      order_type, status, created_at, transaction_hash,
+                      strategy
+               FROM trades WHERE market_slug = ? ORDER BY created_at ASC""",
+            (market_slug,),
+        )
+        cols = [d[0] for d in cur.description]
+        return [dict(zip(cols, row)) for row in cur.fetchall()]
+
     def get_pnl_by_market(self) -> list[dict]:
         """Aggregate trade volume and estimated PnL per market slug.
 

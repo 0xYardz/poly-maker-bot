@@ -1361,17 +1361,32 @@ window.addEventListener('resize', () => {
   }, 150);
 });
 
+const _slugTradesCache = {}; // slug -> trades array
+
 function toggleSlugExpand(slug) {
   if (expandedSlugs.has(slug)) {
     expandedSlugs.delete(slug);
+    if (historicalData?.pnl_by_market) updatePnlByMarket(historicalData.pnl_by_market);
   } else {
     expandedSlugs.add(slug);
+    // Show loading state immediately
+    if (historicalData?.pnl_by_market) updatePnlByMarket(historicalData.pnl_by_market);
+    // Fetch trades from API if not cached
+    if (!_slugTradesCache[slug]) {
+      fetch('/api/trades/' + encodeURIComponent(slug))
+        .then(r => r.json())
+        .then(trades => {
+          _slugTradesCache[slug] = trades;
+          if (historicalData?.pnl_by_market) updatePnlByMarket(historicalData.pnl_by_market);
+        })
+        .catch(() => {});
+    }
   }
-  if (historicalData?.pnl_by_market) updatePnlByMarket(historicalData.pnl_by_market);
 }
 
 function buildTradesForSlug(slug) {
-  const trades = (historicalData?.recent_trades || []).filter(t => t.market_slug === slug);
+  const trades = _slugTradesCache[slug];
+  if (!trades) return '<div class="expand-label" style="color:var(--text-muted)">Loading trades...</div>';
   if (trades.length === 0) return '<div class="expand-label">No trades recorded for this market</div>';
   let h = `<div class="expand-label">${trades.length} trade${trades.length !== 1 ? 's' : ''}</div>`;
   h += '<table><thead><tr><th>Time</th><th>Outcome</th><th>Side</th><th>Size</th><th>Price</th><th class="text-right">USDC</th><th>Type</th><th>Tx</th></tr></thead><tbody>';

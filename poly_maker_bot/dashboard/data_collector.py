@@ -30,6 +30,10 @@ class DashboardDataCollector:
 
     # ── public API ───────────────────────────────────────────
 
+    def get_trades_for_market(self, slug: str) -> list[dict]:
+        """Fetch all trades for a specific market slug directly from DB."""
+        return self._db.get_trades_for_market(slug)
+
     def collect_full_snapshot(self) -> dict:
         """Full snapshot for initial page load (same as realtime now)."""
         return self.collect_realtime_snapshot()
