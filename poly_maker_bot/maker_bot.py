@@ -58,7 +58,7 @@ from poly_maker_bot.utils import (
 )
 from poly_maker_bot.market.discovery import discover_market, Market
 from poly_maker_bot.strategy import StrategyEngine, SimpleMarketMaker, VolatileMarketMaker
-from poly_maker_bot.utils.slug_helpers import Underlying, Timespan
+from poly_maker_bot.utils.slug_helpers import Underlying, Timespan, slug_for_window, window_sec_for_timespan
 from poly_maker_bot.db import TradeDatabase
 from poly_maker_bot.dashboard import DashboardServer
 
@@ -141,7 +141,9 @@ class LiquidityProviderBot:
         # Market lifecycle management
         self._current_market: Optional[Market] = None
         self._next_market: Optional[Market] = None
-        self._strategy: Optional[StrategyEngine] = None
+        self._strategies: dict[str, StrategyEngine] = {}  # {market_slug: strategy}
+        self._strategies_lock = threading.Lock()
+        self._active_strategy_slug: Optional[str] = None
         self._lifecycle_stop = threading.Event()
         self._lifecycle_thread: Optional[threading.Thread] = None
 
@@ -153,6 +155,14 @@ class LiquidityProviderBot:
         self.db = TradeDatabase()
         self.session_id = self.db.start_session()
         self._dashboard: Optional[DashboardServer] = None
+
+    @property
+    def _strategy(self) -> Optional[StrategyEngine]:
+        """The active strategy (tick loop running). For backward compatibility."""
+        slug = self._active_strategy_slug
+        if slug:
+            return self._strategies.get(slug)
+        return None
 
     def setup(self):
         """Initialize all bot components."""
@@ -340,11 +350,12 @@ class LiquidityProviderBot:
         Background loop that manages market window transitions.
 
         Timeline for each 900s window:
-            t=0        : discover current market, start strategy, subscribe orderbook
-            t=840 (T-60): pre-fetch next market via discover_market(window_start_unix=end_ts)
-            t=900      : transition — stop old strategy, start new strategy
+            t=0        : discover current market, start strategy, warm up next 3
+            t=840 (T-60): refresh — discover any new future markets not yet warmed
+            t=900      : transition — stop old strategy, promote next warmed-up strategy
         """
-        PREFETCH_LEAD_SEC = 60  # fetch next market 60s before window end
+        PREFETCH_LEAD_SEC = 60  # refresh future markets 60s before window end
+        FUTURE_MARKETS_COUNT = 3  # always keep next N markets warmed up
 
         while not self._lifecycle_stop.is_set():
             try:
@@ -357,23 +368,31 @@ class LiquidityProviderBot:
                         continue
                     self._activate_market(self._current_market)
 
-                # ── Phase 2: Wait, then pre-fetch next market ──
+                # ── Phase 2: Immediately warm up future markets ──
+                self._prefetch_and_warm_up_future_markets(
+                    self._current_market, FUTURE_MARKETS_COUNT,
+                )
+
+                # ── Phase 3: Wait until T-60, then refresh (pick up any missing) ──
                 now = time.time()
                 prefetch_time = self._current_market.end_ts - PREFETCH_LEAD_SEC
                 wait_for_prefetch = max(0, prefetch_time - now)
 
                 if wait_for_prefetch > 0:
                     logger.info(
-                        "Waiting %.1fs to pre-fetch next market (current ends at %.0f)",
+                        "Waiting %.1fs to refresh future markets (current ends at %.0f)",
                         wait_for_prefetch,
                         self._current_market.end_ts,
                     )
                     if self._lifecycle_stop.wait(timeout=wait_for_prefetch):
                         break  # shutdown requested
 
-                self._next_market = self._discover_next_market(self._current_market)
+                # Refresh: discover any future markets that failed earlier
+                self._prefetch_and_warm_up_future_markets(
+                    self._current_market, FUTURE_MARKETS_COUNT,
+                )
 
-                # ── Phase 3: Wait for window end, then transition ──
+                # ── Phase 4: Wait for window end, then transition ──
                 now = time.time()
                 wait_for_end = max(0, self._current_market.end_ts - now)
                 if wait_for_end > 0:
@@ -381,7 +400,7 @@ class LiquidityProviderBot:
                     if self._lifecycle_stop.wait(timeout=wait_for_end):
                         break  # shutdown requested
 
-                # ── Phase 4: Transition (deactivates old, activates new) ──
+                # ── Phase 5: Transition (deactivates old, promotes next) ──
                 self._transition_to_next_market()
 
             except Exception:
@@ -405,28 +424,44 @@ class LiquidityProviderBot:
             logger.exception("Failed to discover current market")
             return None
 
-    def _discover_next_market(self, current: Market) -> Optional[Market]:
-        """Pre-fetch the market for the next 15m window."""
-        try:
-            next_market = discover_market(
-                client=self.client,
-                window_start_unix=int(current.end_ts),
-                underlying=UNDERLYING,
-                timespan=TIMESPAN,
-            )
-            logger.info("Pre-fetched next market: %s", next_market.slug)
-            return next_market
-        except Exception:
-            logger.exception("Failed to pre-fetch next market")
-            return None
+    def _prefetch_and_warm_up_future_markets(
+        self, current: Market, count: int,
+    ) -> None:
+        """Discover the next *count* markets and place initial orders on each."""
+        ws = window_sec_for_timespan(TIMESPAN)
 
-    def _activate_market(self, market: Market) -> None:
+        for i in range(1, count + 1):
+            future_start_ts = int(current.end_ts) + (i - 1) * ws
+
+            # Skip if we already have a strategy for this window
+            expected_slug = slug_for_window(UNDERLYING, future_start_ts, TIMESPAN)
+            with self._strategies_lock:
+                if expected_slug in self._strategies:
+                    logger.debug("Already have strategy for %s, skipping", expected_slug)
+                    continue
+
+            try:
+                future_market = discover_market(
+                    client=self.client,
+                    window_start_unix=future_start_ts,
+                    underlying=UNDERLYING,
+                    timespan=TIMESPAN,
+                )
+                logger.info("Discovered future market [+%d]: %s", i, future_market.slug)
+                self._warm_up_market(future_market)
+            except Exception:
+                logger.exception("Failed to discover future market +%d", i)
+
+        # Set _next_market for transition (first future market)
+        next_slug = slug_for_window(UNDERLYING, int(current.end_ts), TIMESPAN)
+        with self._strategies_lock:
+            next_strategy = self._strategies.get(next_slug)
+        self._next_market = next_strategy.market if next_strategy else None
+
+    def _warm_up_market(self, market: Market) -> None:
         """
-        Subscribe to orderbook feeds and start strategy for a market.
-
-        1. Subscribe WS orderbook to up_token_id and down_token_id
-        2. Create a StrategyEngine instance
-        3. Start the strategy
+        Subscribe to orderbook feeds and create a strategy in warm-up mode.
+        Places initial orders immediately but does NOT start the tick loop.
         """
         token_ids = [market.up_token_id, market.down_token_id]
 
@@ -439,8 +474,12 @@ class LiquidityProviderBot:
         # Record market in DB
         self.db.record_market(market)
 
-        # Create and start strategy
-        strategy_kwargs = dict(
+        # volatile_mm doesn't use pre-placed orders; skip warm-up
+        if STRATEGY == "volatile_mm":
+            logger.info("VolatileMarketMaker does not support warm-up; skipping %s", market.slug)
+            return
+
+        strategy = SimpleMarketMaker(
             market=market,
             client=self.client,
             order_placer=self.order_placer,
@@ -448,21 +487,72 @@ class LiquidityProviderBot:
             position_tracker=self.position_tracker,
             orderbook_stores=self.orderbook_stores,
         )
-        if STRATEGY == "volatile_mm":
-            self._strategy = VolatileMarketMaker(**strategy_kwargs)
-            logger.info("Using VolatileMarketMaker strategy")
-        else:
-            self._strategy = SimpleMarketMaker(**strategy_kwargs)
-            logger.info("Using SimpleMarketMaker strategy")
-        self._strategy.start()
+        strategy.warm_up()
 
-        logger.info("Market activated: %s", market.slug)
+        with self._strategies_lock:
+            self._strategies[market.slug] = strategy
+
+        logger.info("Market warmed up (initial orders placed): %s", market.slug)
+
+    def _activate_market(self, market: Market) -> None:
+        """
+        Activate a market: subscribe orderbook + start strategy tick loop.
+
+        If the market was already warmed up, promote it (start tick loop only).
+        Otherwise create a fresh strategy and start it.
+        """
+        token_ids = [market.up_token_id, market.down_token_id]
+
+        # Subscribe to orderbook data (idempotent if already subscribed)
+        if self.ws_orderbook_client is not None:
+            self.ws_orderbook_client.add_tokens(token_ids)
+        else:
+            self._init_orderbook_client(token_ids)
+
+        # Record market in DB
+        self.db.record_market(market)
+
+        with self._strategies_lock:
+            existing = self._strategies.get(market.slug)
+
+        if existing and existing._warmed_up:
+            # Promote warmed-up strategy to active (tick loop only, skip on_start)
+            existing.start()
+            self._active_strategy_slug = market.slug
+            logger.info("Promoted warmed-up strategy to active: %s", market.slug)
+        else:
+            # Fresh activation (no warm-up occurred)
+            strategy_kwargs = dict(
+                market=market,
+                client=self.client,
+                order_placer=self.order_placer,
+                order_manager=self.order_manager,
+                position_tracker=self.position_tracker,
+                orderbook_stores=self.orderbook_stores,
+            )
+            if STRATEGY == "volatile_mm":
+                strategy = VolatileMarketMaker(**strategy_kwargs)
+                logger.info("Using VolatileMarketMaker strategy")
+            else:
+                strategy = SimpleMarketMaker(**strategy_kwargs)
+                logger.info("Using SimpleMarketMaker strategy")
+
+            with self._strategies_lock:
+                self._strategies[market.slug] = strategy
+            strategy.start()
+            self._active_strategy_slug = market.slug
+            logger.info("Market activated (fresh): %s", market.slug)
 
     def _deactivate_market(self, market: Market) -> None:
-        """Stop strategy and unsubscribe from orderbook feeds for a market."""
-        if self._strategy and self._strategy.is_running:
-            self._strategy.stop(cancel_orders=True)
-            self._strategy = None
+        """Stop strategy, cancel orders, and unsubscribe from orderbook feeds."""
+        with self._strategies_lock:
+            strategy = self._strategies.pop(market.slug, None)
+
+        if strategy and strategy.can_receive_fills:
+            strategy.stop(cancel_orders=True)
+
+        if self._active_strategy_slug == market.slug:
+            self._active_strategy_slug = None
 
         token_ids = [market.up_token_id, market.down_token_id]
         if self.ws_orderbook_client is not None:
@@ -470,14 +560,38 @@ class LiquidityProviderBot:
 
         logger.info("Market deactivated: %s", market.slug)
 
+    def _cleanup_expired_strategies(self) -> None:
+        """Remove strategies for markets whose windows have already ended."""
+        now = time.time()
+        with self._strategies_lock:
+            expired_slugs = [
+                slug for slug, strategy in self._strategies.items()
+                if strategy.market.end_ts < now
+                and slug != self._active_strategy_slug
+            ]
+        for slug in expired_slugs:
+            with self._strategies_lock:
+                strategy = self._strategies.pop(slug, None)
+            if strategy:
+                strategy.stop(cancel_orders=True)
+                # Also unsubscribe and clean positions
+                m = strategy.market
+                token_ids = [m.up_token_id, m.down_token_id]
+                if self.ws_orderbook_client is not None:
+                    self.ws_orderbook_client.remove_tokens(token_ids)
+                removed = self.position_tracker.remove_tokens(token_ids)
+                if removed:
+                    logger.info("Cleared %d position(s) from expired market %s", removed, slug)
+                logger.info("Cleaned up expired strategy: %s", slug)
+
     def _transition_to_next_market(self) -> None:
         """
         Seamless transition from current market to next market.
 
         1. Stop strategy on old market (cancel orders)
         2. Unsubscribe old tokens from orderbook WS
-        3. Subscribe new tokens to orderbook WS
-        4. Start strategy on new market
+        3. Clean up expired strategies
+        4. Promote or start strategy on new market
         """
         old_market = self._current_market
         new_market = self._next_market
@@ -489,6 +603,9 @@ class LiquidityProviderBot:
             removed = self.position_tracker.remove_tokens(old_tokens)
             if removed:
                 logger.info("Cleared %d position(s) from ended market %s", removed, old_market.slug)
+
+        # Clean up any other strategies for markets that have ended
+        self._cleanup_expired_strategies()
 
         if new_market is None:
             # Pre-fetch failed earlier — try again synchronously
@@ -614,7 +731,13 @@ class LiquidityProviderBot:
                 logger.exception("Error checking resolution for %s", slug)
 
     def _get_market_for_token(self, token_id: str) -> Optional[Market]:
-        """Return the current market if it owns this token, else None."""
+        """Return the market that owns this token, checking all tracked strategies."""
+        with self._strategies_lock:
+            for strategy in self._strategies.values():
+                m = strategy.market
+                if token_id in (m.up_token_id, m.down_token_id):
+                    return m
+        # Fallback: check _current_market (in case no strategy exists yet)
         m = self._current_market
         if m and token_id in (m.up_token_id, m.down_token_id):
             return m
@@ -630,24 +753,28 @@ class LiquidityProviderBot:
         trade_id: str = "",
         status: str = "CONFIRMED",
     ) -> None:
-        """Forward a fill event to the active strategy if it owns this token."""
-        if not self._strategy or not self._strategy.is_running:
-            return
+        """Forward a fill event to whichever strategy owns this token."""
+        with self._strategies_lock:
+            strategies = list(self._strategies.values())
 
-        market_tokens = {
-            self._strategy.market.up_token_id,
-            self._strategy.market.down_token_id,
-        }
-        if asset_id in market_tokens:
-            self._strategy.on_fill(
-                token_id=asset_id,
-                side=side,
-                price=price,
-                size=size,
-                order_id=order_id,
-                trade_id=trade_id,
-                status=status,
-            )
+        for strategy in strategies:
+            if not strategy.can_receive_fills:
+                continue
+            market_tokens = {
+                strategy.market.up_token_id,
+                strategy.market.down_token_id,
+            }
+            if asset_id in market_tokens:
+                strategy.on_fill(
+                    token_id=asset_id,
+                    side=side,
+                    price=price,
+                    size=size,
+                    order_id=order_id,
+                    trade_id=trade_id,
+                    status=status,
+                )
+                return  # tokens are unique across markets
 
     # ── WebSocket callbacks ──────────────────────────────────────
 
@@ -872,11 +999,15 @@ class LiquidityProviderBot:
                 self._market_discovery_thread.join(timeout=5.0)
                 logger.info("Market discovery timer thread stopped")
 
-            # Stop active strategy (cancels its orders)
-            if self._strategy and self._strategy.is_running:
-                logger.info("Stopping active strategy...")
-                self._strategy.stop(cancel_orders=True)
-                logger.info("Active strategy stopped")
+            # Stop all strategies (active + warmed up)
+            with self._strategies_lock:
+                all_strategies = list(self._strategies.items())
+                self._strategies.clear()
+            for slug, strategy in all_strategies:
+                logger.info("Stopping strategy for %s...", slug)
+                strategy.stop(cancel_orders=True)
+            self._active_strategy_slug = None
+            logger.info("All strategies stopped")
 
             # Cancel any remaining open orders
             if self.order_manager.open_orders:

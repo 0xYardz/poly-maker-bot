@@ -47,11 +47,27 @@ class StrategyEngine(abc.ABC):
         self.position_tracker = position_tracker
         self.orderbook_stores = orderbook_stores
 
+        self._warmed_up = False
         self._running = False
         self._stop_event = threading.Event()
         self._thread: Optional[threading.Thread] = None
 
     # ── public interface ──────────────────────────────────────────
+
+    def warm_up(self) -> None:
+        """Place initial orders WITHOUT starting the tick loop.
+
+        The strategy can receive on_fill() calls in this state.
+        Call start() later to begin the tick loop; it will skip on_start()
+        since initial orders are already placed.
+        """
+        if self._warmed_up or self._running:
+            logger.warning(
+                "Strategy already warmed up or running for %s", self.market.slug
+            )
+            return
+        self._warmed_up = True
+        self.on_start()
 
     def start(self) -> None:
         """Start the strategy loop in a background daemon thread."""
@@ -72,14 +88,15 @@ class StrategyEngine(abc.ABC):
     def stop(self, cancel_orders: bool = True) -> None:
         """
         Stop the strategy loop and optionally cancel all outstanding orders
-        for this market.
+        for this market.  Works for both warmed-up and fully running strategies.
         """
-        if not self._running:
+        if not self._running and not self._warmed_up:
             return
 
         logger.info("Stopping strategy for market %s", self.market.slug)
         self._stop_event.set()
         self._running = False
+        self._warmed_up = False
 
         if self._thread and self._thread.is_alive():
             self._thread.join(timeout=5.0)
@@ -90,6 +107,11 @@ class StrategyEngine(abc.ABC):
     @property
     def is_running(self) -> bool:
         return self._running
+
+    @property
+    def can_receive_fills(self) -> bool:
+        """True if this strategy can process on_fill() calls."""
+        return self._warmed_up or self._running
 
     # ── methods subclasses MUST implement ────────────────────────
 
@@ -150,7 +172,8 @@ class StrategyEngine(abc.ABC):
     def _run_loop(self) -> None:
         """Main loop: calls on_tick() at tick_interval_sec() cadence."""
         try:
-            self.on_start()
+            if not self._warmed_up:
+                self.on_start()
             while not self._stop_event.is_set():
                 try:
                     self.on_tick()
